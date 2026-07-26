@@ -1086,14 +1086,14 @@ class StyleSheet:
         self._by_style_key: dict[tuple, str] = {}
         self.rules: list[tuple[str, str, str]] = []
 
-    def class_for(self, cell) -> str:
+    def class_for(self, cell, grid_r: bool = True, grid_b: bool = True) -> str:
         try:
-            key = tuple(cell._style)
+            key = (tuple(cell._style), grid_r, grid_b)
         except Exception:
             key = None
         if key is not None and key in self._by_style_key:
             return self._by_style_key[key]
-        td, sp = self._build(cell)
+        td, sp = self._build(cell, grid_r, grid_b)
         name = self._by_decl.get((td, sp))
         if name is None:
             name = f"s{len(self._by_decl)}"
@@ -1103,7 +1103,7 @@ class StyleSheet:
             self._by_style_key[key] = name
         return name
 
-    def _build(self, cell) -> tuple[str, str]:
+    def _build(self, cell, grid_r: bool = True, grid_b: bool = True) -> tuple[str, str]:
         R = self.resolver
         font, fill, border, al = cell.font, cell.fill, cell.border, cell.alignment
         td: list[str] = []
@@ -1133,9 +1133,12 @@ class StyleSheet:
             css = border_css(getattr(border, side, None), R) if border else None
             if css:
                 td.append(f"{prop}:{css}")
-            elif self.gridlines and prop in ("border-right", "border-bottom"):
+            elif self.gridlines and ((prop == "border-right" and grid_r)
+                                     or (prop == "border-bottom" and grid_b)):
                 # 色を CSS 変数にしておき、画面の切り替えと印刷時の非表示を効かせる。
                 # 幅は 1px のまま残るので、消しても方眼の位置はずれない。
+                # 隣のセルが罫線を持つ辺には出さない（grid_r / grid_b）。border-collapse は
+                # 太さが同じなら左・上側の線を採用するため、目盛線が隣の罫線を消してしまう。
                 td.append(f"{prop}:1px solid var(--gl)")
         # 斜線
         if border is not None:
@@ -1384,6 +1387,23 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                 occ.add(cc)
         occupied[r] = occ
 
+    def has_border(r: int, c: int, side: str) -> bool:
+        if not (min_row <= r <= max_row and min_col <= c <= max_col):
+            return False
+        b = ws.cell(row=r, column=c).border
+        s = getattr(b, side, None) if b is not None else None
+        return bool(s is not None and s.style)
+
+    def grid_edges(r: int, c: int, rs: int, cs: int) -> tuple[bool, bool]:
+        """右辺・下辺に目盛線を引いてよいか。隣に罫線があるなら引かない。"""
+        if not gridlines:
+            return True, True
+        rb = r + rs
+        while rb in grid.hidden_rows:            # 非表示行は出力しないので、その先を見る
+            rb += 1
+        return (not any(has_border(rr, c + cs, "left") for rr in range(r, r + rs)),
+                not any(has_border(rb, cc, "top") for cc in range(c, c + cs)))
+
     def free_width(r: int, c_from: int, step: int) -> tuple[float, bool]:
         """隣接する空セルの合計幅と、行端まで空だったかを返す。"""
         w = 0.0
@@ -1439,9 +1459,9 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                 continue
             sr, sc = src.get((r, c), (r, c))
             cell = ws.cell(row=sr, column=sc)
-            cls = styles.class_for(cell)
-            attr = f' class="{cls}"'
             rs, cs = spans.get((r, c), (1, 1))
+            cls = styles.class_for(cell, *grid_edges(r, c, rs, cs))
+            attr = f' class="{cls}"'
             if rs > 1:
                 attr += f' rowspan="{rs}"'
             if cs > 1:
@@ -1900,7 +1920,9 @@ def convert(src: str, dst: str, opts) -> str:
         elif opts.gridlines == "off":
             gl = False
         else:
-            gl = bool(getattr(ws.sheet_view, "showGridLines", True))
+            # 属性が省略されている場合、OOXML の既定は「表示する」
+            sv = getattr(ws.sheet_view, "showGridLines", None)
+            gl = True if sv is None else bool(sv)
         max_row = min(ws.max_row or 1, opts.max_rows)
         max_col = min(ws.max_column or 1, opts.max_cols)
         grid_for_shapes = Grid(ws, max_col, max_row)
