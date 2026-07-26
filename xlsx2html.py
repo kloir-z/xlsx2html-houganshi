@@ -40,7 +40,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module=r"openpyxl.*")
 
 try:
     from openpyxl import load_workbook
-    from openpyxl.utils import get_column_letter
+    from openpyxl.utils import column_index_from_string, get_column_letter
 except ImportError:  # pragma: no cover
     sys.exit("openpyxl が必要です:  pip install openpyxl")
 
@@ -1314,12 +1314,120 @@ def tidy_formula(f: str) -> str:
     return re.sub(r"_xlfn\.(_xlws\.)?", "", f)
 
 
+ERROR_TEXTS = {"#VALUE!", "#REF!", "#N/A", "#DIV/0!", "#NAME?", "#NULL!", "#NUM!",
+               "#SPILL!", "#CALC!", "#FIELD!", "#BLOCKED!", "#CONNECT!", "#GETTING_DATA"}
+
+_CELL_FILENAME = re.compile(r'CELL\s*\(\s*"filename"', re.I)
+_FIND_RBRACKET = re.compile(r'FIND\s*\(\s*"\]"', re.I)
+_FIND_LBRACKET = re.compile(r'FIND\s*\(\s*"\["', re.I)
+# 「= 他のセルを参照するだけ」の数式。'目次'!$A$1 や Sheet1!A1、A1 を拾う
+_PLAIN_REF = re.compile(r"^=\s*(?:(?:'([^']*)'|([^'!\s()+\-*/,]+))!)?\$?([A-Z]{1,3})\$?([1-9]\d*)\s*$")
+_STR_LIT = re.compile(r'^"((?:[^"]|"")*)"$')
+
+
+def _split_concat(expr: str) -> list[str]:
+    """文字列リテラルの中を避けて & で分割する。"""
+    parts, buf, quoted = [], "", False
+    for ch in expr:
+        if ch == '"':
+            quoted = not quoted
+            buf += ch
+        elif ch == "&" and not quoted:
+            parts.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    parts.append(buf)
+    return parts
+
+
+def _eval_refs(formula: str, sheet: str, known: dict[str, dict[tuple[int, int], str]]) -> str | None:
+    """解決済みセルへの参照と文字列リテラルの連結だけを評価する。
+
+    ='目次'!$A$1 や ="("&'14.2.用紙'!$A$1&"に記載)" が対象。ひとつでも
+    評価できない項があれば None を返し、元の保存値をそのまま使う。
+    """
+    parts = []
+    for tok in _split_concat(formula.lstrip("=")):
+        tok = tok.strip()
+        lit = _STR_LIT.match(tok)
+        if lit:
+            parts.append(lit.group(1).replace('""', '"'))
+            continue
+        ref = _PLAIN_REF.match("=" + tok)
+        if not ref:
+            return None
+        try:
+            tgt = (int(ref.group(4)), column_index_from_string(ref.group(3)))
+        except ValueError:
+            return None
+        text = known.get(ref.group(1) or ref.group(2) or sheet, {}).get(tgt)
+        if text is None:
+            return None
+        parts.append(text)
+    return "".join(parts)
+
+
+def resolve_sheet_name_formulas(wb, formulas: dict[str, dict],
+                                book_name: str) -> dict[str, dict[tuple[int, int], str]]:
+    """CELL("filename") でシート名・ブック名を出す定番の式を解決する。
+
+    CELL は揮発性関数なので Excel は開くたびに再計算するが、保護ビュー
+    （「編集を有効にする」が出ている状態）ではパスを取得できず #VALUE! になり、
+    その値がそのまま xlsx に保存されていることがある。Excel の画面では見えない
+    エラーなので、保存値がエラーのときだけ解決した文字列に差し替える。
+
+    フォルダのパスを取り出す形は、変換した環境のパスが出てしまうので触らない。
+    """
+    out: dict[str, dict[tuple[int, int], str]] = {}
+    for name, m in formulas.items():
+        if name not in wb.sheetnames:
+            continue
+        ws = wb[name]
+        for (r, c), f in m.items():
+            if not _CELL_FILENAME.search(f):
+                continue
+            v = ws.cell(row=r, column=c).value
+            if not (isinstance(v, str) and v in ERROR_TEXTS):
+                continue
+            rb, lb = bool(_FIND_RBRACKET.search(f)), bool(_FIND_LBRACKET.search(f))
+            if rb and lb:
+                out.setdefault(name, {})[(r, c)] = book_name    # [ ] の中＝ブック名
+            elif rb:
+                out.setdefault(name, {})[(r, c)] = name         # ] の後ろ＝シート名
+    if not out:
+        return out
+
+    # 上で解決したセルを参照しているだけのセル（目次など）にも波及させる
+    for _ in range(3):
+        added = 0
+        for name, m in formulas.items():
+            if name not in wb.sheetnames:
+                continue
+            ws = wb[name]
+            for (r, c), f in m.items():
+                if (r, c) in out.get(name, {}):
+                    continue
+                v = ws.cell(row=r, column=c).value
+                if not (isinstance(v, str) and v in ERROR_TEXTS):
+                    continue
+                text = _eval_refs(f, name, out)
+                if text is None:
+                    continue
+                out.setdefault(name, {})[(r, c)] = text
+                added += 1
+        if not added:
+            break
+    return out
+
+
 def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                  gridlines: bool, sheet_id: str, opts,
                  formulas: dict[tuple[int, int], str] | None = None,
                  bounds: tuple[int, int, int, int] | None = None,
                  page_breaks: set[int] | None = None,
-                 title_rows: tuple[int, int] | None = None) -> dict:
+                 title_rows: tuple[int, int] | None = None,
+                 overrides: dict[tuple[int, int], str] | None = None) -> dict:
     full_row = min(ws.max_row or 1, opts.max_rows)
     full_col = min(ws.max_column or 1, opts.max_cols)
     grid = Grid(ws, full_col, full_row)
@@ -1351,6 +1459,7 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
     content: dict[tuple[int, int], str] = {}
     occupied: dict[int, set[int]] = {}
     formulas = formulas or {}
+    overrides = overrides or {}
     missing_cache = 0
     for r in range(min_row, max_row + 1):
         occ = set()
@@ -1360,6 +1469,14 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                 continue
             sr, sc = src.get((r, c), (r, c))
             cell = ws.cell(row=sr, column=sc)
+            ov = overrides.get((sr, sc))
+            if ov is not None:      # Excel なら再計算されて出るはずの文字列
+                content[(r, c)] = esc(ov)
+                occ.add(c)
+                rs, cs = spans.get((r, c), (1, 1))
+                for cc in range(c, min(c + cs, max_col + 1)):
+                    occ.add(cc)
+                continue
             if cell.value is None:
                 # 数式なのに計算結果が保存されていないセル
                 fml = formulas.get((r, c))
@@ -1907,6 +2024,15 @@ def convert(src: str, dst: str, opts) -> str:
     n_formula = sum(len(m) for m in formulas.values())
     missing_total = 0
 
+    # 保護ビューのせいで #VALUE! が保存されているシート名の式を解決しておく
+    fixed: dict[str, dict[tuple[int, int], str]] = {}
+    if formulas:
+        try:
+            fixed = resolve_sheet_name_formulas(wb, formulas, os.path.basename(src))
+        except Exception as e:      # 解決できなくても保存値をそのまま出せばよい
+            print(f"警告: シート名の式を解決できませんでした ({e})", file=sys.stderr)
+    n_fixed = sum(len(m) for m in fixed.values())
+
     sheets = []
     for name in targets:
         if name not in wb.sheetnames:
@@ -1935,7 +2061,7 @@ def convert(src: str, dst: str, opts) -> str:
         bounds = print_area_bounds(ws, opts) if opts.print_area else None
         breaks = {b.id + 1 for b in ws.row_breaks.brk} if ws.row_breaks else set()
         res = render_sheet(ws, resolver, shapes, gl, name, opts, formulas.get(name),
-                           bounds, breaks, title_row_range(ws))
+                           bounds, breaks, title_row_range(ws), fixed.get(name))
         missing_total += res["missing"]
         page = page_settings(ws, res["width"]) if not opts.no_page_setup else None
         po = getattr(ws, "print_options", None)
@@ -1953,6 +2079,8 @@ def convert(src: str, dst: str, opts) -> str:
     if n_formula:
         print(f"  数式セル {n_formula} 個 → 保存済みの計算結果を表示"
               + (f"（うち {missing_total} 個は結果が未保存）" if missing_total else ""))
+    if n_fixed:
+        print(f"  シート名を出す数式 {n_fixed} 個 → 保存されていたエラーを解決して表示")
     if missing_total and not opts.show_formula:
         print("  ※ 計算結果が保存されていない数式セルは空欄になります。"
               "Excel で開いて上書き保存するか、--show-formula で数式そのものを出せます。",
