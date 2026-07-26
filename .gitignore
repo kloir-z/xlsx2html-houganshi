@@ -1,0 +1,19 @@
+# 変換結果（生成物）
+*.html
+!docs/*.html
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / エディタ
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+
+# 一時ファイル
+_logo.png
+*.tmp
