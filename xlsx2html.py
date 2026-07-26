@@ -53,7 +53,7 @@ EMU_PER_PX = 9525.0          # 1px = 9525 EMU (96dpi)
 MDW = 7                      # 標準フォントの数字1文字幅(px)。Calibri 11 / MS Pゴシック 11 とも 7
 DEFAULT_COL_WIDTH = 8.43     # Excel 既定の列幅(文字数)
 DEFAULT_ROW_HEIGHT_PT = 18.75
-GRID_COLOR = "#d0d0d0"       # Excel の目盛線相当
+GRID_COLOR = "#e8e8e8"       # Excel の目盛線相当（画面表示のみ、既定では印刷されない）
 CELL_PAD = 2                 # セルの左右パディング(px)。Excel 実測相当
 INDENT_PX = 8                # インデント1段あたりの px
 
@@ -1134,7 +1134,9 @@ class StyleSheet:
             if css:
                 td.append(f"{prop}:{css}")
             elif self.gridlines and prop in ("border-right", "border-bottom"):
-                td.append(f"{prop}:1px solid {GRID_COLOR}")
+                # 色を CSS 変数にしておき、画面の切り替えと印刷時の非表示を効かせる。
+                # 幅は 1px のまま残るので、消しても方眼の位置はずれない。
+                td.append(f"{prop}:1px solid var(--gl)")
         # 斜線
         if border is not None:
             diag_css = []
@@ -1703,7 +1705,8 @@ def title_row_range(ws) -> tuple[int, int] | None:
 # ---------------------------------------------------------------------------
 
 PAGE_CSS = """
-:root{color-scheme:light}
+:root{color-scheme:light;--gl:%(grid)s}
+body.nogl{--gl:transparent}
 *{box-sizing:border-box}
 body{margin:0;background:#f3f3f3;font-family:%(ff)s;color:#000}
 .tabs{position:sticky;top:0;z-index:50;display:flex;gap:2px;padding:6px 8px 0;
@@ -1713,6 +1716,7 @@ body{margin:0;background:#f3f3f3;font-family:%(ff)s;color:#000}
 .tabs button.on{background:#fff;color:#107c41;font-weight:700;box-shadow:inset 0 2px 0 #107c41}
 .tabs .tg{margin-left:auto;align-self:center;font-size:12px;color:#444;padding:0 6px 5px;
   display:flex;gap:5px;align-items:center;cursor:pointer;user-select:none}
+.tabs .tg~.tg{margin-left:14px}   /* 2つ目以降は右端に並べる */
 .wrap{padding:16px 48px 72px;overflow:auto}
 .sheet{display:none}
 .sheet.on{display:block}
@@ -1745,6 +1749,7 @@ img.dobj{object-fit:fill}
   padding:3px 5px;font-size:10.5pt;line-height:1.25}
 .dtx p{margin:0}
 @media print{
+  :root{--gl:transparent}          /* Excel と同じく目盛線は印刷しない */
   body{background:#fff}
   .tabs{display:none}
   .wrap{padding:0;overflow:visible}
@@ -1758,7 +1763,7 @@ img.dobj{object-fit:fill}
 
 
 def build_html(title: str, sheets: list[dict]) -> str:
-    css = [PAGE_CSS % {"ff": FONT_FALLBACK, "pad": CELL_PAD}]
+    css = [PAGE_CSS % {"ff": FONT_FALLBACK, "pad": CELL_PAD, "grid": GRID_COLOR}]
     for i, s in enumerate(sheets):
         # シートごとにクラスで名前空間を切る（id で切ると詳細度が高すぎて
         # 見切れ表示などの上書きが効かなくなる）
@@ -1775,6 +1780,8 @@ def build_html(title: str, sheets: list[dict]) -> str:
                        f".s-{i}{{page:p{i}}}")
             if abs(pg["zoom"] - 1.0) > 0.01:
                 css.append(f"@media print{{.s-{i} .canvas{{zoom:{pg['zoom']:.4f}}}}}")
+        if s.get("print_gridlines"):     # Excel 側で「枠線を印刷する」が有効なシート
+            css.append(f"@media print{{.s-{i}{{--gl:{GRID_COLOR}}}}}")
     tabs = "".join(
         f'<button data-i="{i}" class="{"on" if i == 0 else ""}">{esc(s["name"])}</button>'
         for i, s in enumerate(sheets))
@@ -1809,6 +1816,10 @@ var cb=document.getElementById('markclip');
 if(cb)cb.addEventListener('change',function(){
   document.body.classList.toggle('mark',cb.checked);
 });
+var gl=document.getElementById('gridlines');
+if(gl)gl.addEventListener('change',function(){
+  document.body.classList.toggle('nogl',!gl.checked);
+});
 // クリックで開閉。ドラッグ（範囲選択）と区別するため、押した位置から動いた場合と
 // 文字が選択されている場合は無視する。
 var px=0,py=0;
@@ -1830,6 +1841,10 @@ mark(document.querySelector('.sheet.on'));
     toggle = ('<label class="tg" title="Excel と同じ位置で文字が切れているセルに印を付けます。'
               '印の有無にかかわらず、クリックすると全文を表示できます">'
               '<input type="checkbox" id="markclip">見切れに印</label>')
+    if any(s.get("gridlines") for s in sheets):
+        toggle = ('<label class="tg" title="Excel の目盛線（薄いグレーの線）の表示を切り替えます。'
+                  '印刷には元から出ません">'
+                  '<input type="checkbox" id="gridlines" checked>目盛線</label>') + toggle
     tabs_html = f'<div class="tabs">{tabs if len(sheets) > 1 else ""}{toggle}</div>'
     return (f'<!doctype html>\n<html lang="ja"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -1901,7 +1916,10 @@ def convert(src: str, dst: str, opts) -> str:
                            bounds, breaks, title_row_range(ws))
         missing_total += res["missing"]
         page = page_settings(ws, res["width"]) if not opts.no_page_setup else None
-        sheets.append({"name": name, "html": res["html"], "css": res["css"], "page": page})
+        po = getattr(ws, "print_options", None)
+        sheets.append({"name": name, "html": res["html"], "css": res["css"], "page": page,
+                       "gridlines": gl,
+                       "print_gridlines": bool(gl and po is not None and po.gridLines)})
         note = f", 計算結果なしの数式{res['missing']}個" if res["missing"] else ""
         area = "（印刷範囲で切り出し）" if bounds else ""
         print(f"  ・{name}: {res['cols']}列 × {res['rows']}行, 図形{len(shapes)}個{note}{area}")
