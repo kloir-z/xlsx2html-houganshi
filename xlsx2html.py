@@ -3339,6 +3339,131 @@ def check_container(src: str):
         raise SystemExit("xlsx として読めない形式です。")
 
 
+_FUNC_RE = re.compile(r"([A-Z][A-Z0-9_.]*)\s*\(")
+
+
+def diagnose(src: str, opts) -> None:
+    """数式まわりの状態だけを調べて表示する。
+
+    セルの中身（値・文字列）は一切出さない。出すのは件数と、関数名・セル番地だけ。
+    機密ファイルでも安全に実行して結果を共有できるようにしてある。
+    """
+    check_container(src)
+    print(f"■ 診断: {src}\n")
+
+    with zipfile.ZipFile(src) as z:
+        names = set(z.namelist())
+        try:
+            app = ET.fromstring(z.read("docProps/app.xml"))
+            gen = "".join(e.text or "" for e in app if e.tag.endswith("}Application"))
+            ver = "".join(e.text or "" for e in app if e.tag.endswith("}AppVersion"))
+            print(f"作成アプリ : {gen or '不明'} {ver}")
+        except (KeyError, ET.ParseError):
+            print("作成アプリ : 不明（docProps/app.xml なし＝Excel 以外の生成物の可能性）")
+        try:
+            wbx = ET.fromstring(z.read("xl/workbook.xml"))
+            cp = wbx.find(f"{{{MAIN}}}calcPr")
+            if cp is not None:
+                print(f"計算設定   : calcId={cp.get('calcId')} "
+                      f"calcMode={cp.get('calcMode') or 'auto'} "
+                      f"fullCalcOnLoad={cp.get('fullCalcOnLoad') or '0'}")
+                if cp.get("fullCalcOnLoad") in ("1", "true"):
+                    print("             → Excel は開くたび全再計算する設定。"
+                          "保存済みの計算結果は古い可能性が高い")
+                if (cp.get("calcMode") or "auto") == "manual":
+                    print("             → 手動計算。保存値が最新とは限らない")
+            else:
+                print("計算設定   : calcPr なし")
+        except (KeyError, ET.ParseError):
+            pass
+        print(f"calcChain  : {'あり' if 'xl/calcChain.xml' in names else 'なし'}"
+              f"（なし＝Excel が計算結果を書いていない可能性）")
+
+    wb_v = load_workbook(src, data_only=True)
+    wb_f = load_workbook(src, data_only=False, read_only=True)
+    targets = wb_v.sheetnames if not opts.sheet else [opts.sheet]
+    try:
+        from openpyxl.worksheet.formula import ArrayFormula
+    except ImportError:
+        ArrayFormula = ()
+
+    funcs: dict[str, int] = {}
+    tot = {"f": 0, "none": 0, "err": 0, "num": 0, "str": 0, "array": 0}
+    for name in targets:
+        if name not in wb_v.sheetnames:
+            continue
+        wsv, wsf = wb_v[name], wb_f[name]
+        per_col: dict[int, list[tuple[int, object]]] = {}
+        n_f = n_none = n_err = n_arr = 0
+        for row in wsf.iter_rows():
+            for cell in row:
+                fv = cell.value
+                if ArrayFormula and isinstance(fv, ArrayFormula):
+                    fv, n_arr = fv.text, n_arr + 1
+                if not (isinstance(fv, str) and fv.startswith("=")):
+                    continue
+                n_f += 1
+                for fn in _FUNC_RE.findall(tidy_formula(fv).upper()):
+                    funcs[fn] = funcs.get(fn, 0) + 1
+                v = wsv.cell(row=cell.row, column=cell.column).value
+                if v is None:
+                    n_none += 1
+                elif isinstance(v, str) and v in ERROR_TEXTS:
+                    n_err += 1
+                    tot["err"] += 1
+                else:
+                    tot["num" if isinstance(v, (int, float)) else "str"] += 1
+                per_col.setdefault(cell.column, []).append((cell.row, v))
+        tot["f"] += n_f
+        tot["none"] += n_none
+        tot["array"] += n_arr
+        if not n_f:
+            continue
+        print(f"\n── シート '{name}'")
+        print(f"   数式セル {n_f} 個 / 計算結果なし {n_none} 個 / エラー値 {n_err} 個"
+              + (f" / 配列数式 {n_arr} 個" if n_arr else ""))
+
+        # 「同じ計算結果ばかり」の検出: 縦に連続する数式セルの保存値が同一な区間
+        worst = None
+        n_runs = 0
+        for col, items in per_col.items():
+            items.sort()
+            run_start, run_len = 0, 1
+            for i in range(1, len(items) + 1):
+                same = (i < len(items) and items[i][0] == items[i - 1][0] + 1
+                        and items[i][1] == items[i - 1][1] and items[i][1] is not None)
+                if same:
+                    run_len += 1
+                    continue
+                if run_len >= 3:
+                    n_runs += 1
+                    if worst is None or run_len > worst[0]:
+                        worst = (run_len, col, items[run_start][0])
+                run_start, run_len = i, 1
+        if worst:
+            a = f"{get_column_letter(worst[1])}{worst[2]}"
+            b = f"{get_column_letter(worst[1])}{worst[2] + worst[0] - 1}"
+            print(f"   ※ 縦に連続する数式セルで保存値が同一の区間が {n_runs} か所"
+                  f"（最長 {worst[0]} セル: {a}:{b}）")
+            print("     → Excel の画面で同じ範囲がどう見えるか比べてください。"
+                  "Excel 側も同じ値なら変換は正しく、")
+            print("       Excel 側が違う値なら、xlsx に保存された計算結果自体が古いということです。")
+        else:
+            print("   保存値が縦に不自然な形で揃っている箇所はありません")
+
+    print(f"\n── 全体: 数式 {tot['f']} 個"
+          f" / 計算結果なし {tot['none']} 個 / エラー値 {tot['err']} 個"
+          f" / 数値 {tot['num']} 個 / 文字列 {tot['str']} 個")
+    if funcs:
+        top = sorted(funcs.items(), key=lambda kv: -kv[1])[:25]
+        print("   使われている関数: " + ", ".join(f"{k}×{v}" for k, v in top))
+    if tot["none"]:
+        print("   ※ 計算結果が保存されていないセルがあります。"
+              "Excel で開いて上書き保存すると解消します。", file=sys.stderr)
+    wb_v.close()
+    wb_f.close()
+
+
 def convert(src: str, dst: str, opts) -> str:
     check_container(src)
     wb = load_workbook(src, data_only=True, rich_text=True)
@@ -3470,6 +3595,8 @@ def main(argv=None):
     ap.add_argument("--no-drawings", action="store_true", help="画像・図形を出力しない")
     ap.add_argument("--no-cond-format", action="store_true",
                     help="条件付き書式（色付け・データバー・アイコン）を反映しない")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="変換せず、数式まわりの状態だけを調べて表示する")
     ap.add_argument("--hidden-sheets", action="store_true", help="非表示シートも出力する")
     ap.add_argument("--max-cols", type=int, default=1024, help="出力する最大列数")
     ap.add_argument("--max-rows", type=int, default=20000, help="出力する最大行数")
@@ -3488,6 +3615,9 @@ def main(argv=None):
     src = opts.input
     if not os.path.exists(src):
         raise SystemExit(f"入力が見つかりません: {src}")
+    if opts.diagnose:
+        diagnose(src, opts)
+        return
     dst = opts.output or os.path.splitext(src)[0] + ".html"
     print(f"変換中: {src}")
     convert(src, dst, opts)
