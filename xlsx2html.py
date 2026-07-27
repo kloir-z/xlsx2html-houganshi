@@ -1288,13 +1288,18 @@ class StyleSheet:
             css = border_css(getattr(border, side, None), R) if border else None
             if css:
                 td.append(f"{prop}:{css}")
+            elif bg:
+                # Excel では塗りが目盛線を覆い隠す。罫線が無くても線は出ない。
+                continue
             elif self.gridlines and ((prop == "border-right" and grid_r)
                                      or (prop == "border-bottom" and grid_b)):
                 # 色を CSS 変数にしておき、画面の切り替えと印刷時の非表示を効かせる。
                 # 幅は 1px のまま残るので、消しても方眼の位置はずれない。
                 # 隣のセルが罫線を持つ辺には出さない（grid_r / grid_b）。border-collapse は
                 # 太さが同じなら左・上側の線を採用するため、目盛線が隣の罫線を消してしまう。
-                td.append(f"{prop}:1px solid var(--gl)")
+                # --glr / --glb は「はみ出した文字が横切った目盛線」を JS で消すための穴。
+                v = "--glr" if prop == "border-right" else "--glb"
+                td.append(f"{prop}:1px solid var({v},var(--gl))")
         # 斜線
         if border is not None:
             diag_css = []
@@ -1576,6 +1581,24 @@ def resolve_sheet_name_formulas(wb, formulas: dict[str, dict],
     return out
 
 
+_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def est_text_px(text: str, pt: float, bold: bool) -> float:
+    """文字列の描画幅を『多めに』見積もる。はみ出しの可能性がある行だけを
+    ブラウザ側で実測させるための足切りに使うので、過大評価する分には害がない。"""
+    w = 0.0
+    for ch in text:
+        o = ord(ch)
+        if o < 0x2E80 or 0xFF61 <= o <= 0xFF9F:
+            w += 0.62          # 半角
+        else:
+            w += 1.02          # 全角
+    if bold:
+        w *= 1.06
+    return w * pt * 4.0 / 3.0
+
+
 def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                  gridlines: bool, sheet_id: str, opts,
                  formulas: dict[tuple[int, int], str] | None = None,
@@ -1612,6 +1635,7 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
     # 1パス目: 表示文字列を確定し、行ごとの「文字が入っているセル」を把握する
     #（Excel は隣が空セルのときだけ文字をはみ出させるため、その判定に使う）
     content: dict[tuple[int, int], str] = {}
+    plain: dict[tuple[int, int], str] = {}
     occupied: dict[int, set[int]] = {}
     formulas = formulas or {}
     overrides = overrides or {}
@@ -1624,13 +1648,18 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                 continue
             sr, sc = src.get((r, c), (r, c))
             cell = ws.cell(row=sr, column=sc)
+
+            def put(html_text: str, raw: str):
+                content[(r, c)] = html_text
+                plain[(r, c)] = raw
+                occ.add(c)
+                rs_, cs_ = spans.get((r, c), (1, 1))
+                for cc in range(c, min(c + cs_, max_col + 1)):
+                    occ.add(cc)
+
             ov = overrides.get((sr, sc))
             if ov is not None:      # Excel なら再計算されて出るはずの文字列
-                content[(r, c)] = esc(ov)
-                occ.add(c)
-                rs, cs = spans.get((r, c), (1, 1))
-                for cc in range(c, min(c + cs, max_col + 1)):
-                    occ.add(cc)
+                put(esc(ov), ov)
                 continue
             if cell.value is None:
                 # 数式なのに計算結果が保存されていないセル
@@ -1640,23 +1669,18 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                 missing_cache += 1
                 if not opts.show_formula:
                     continue
-                content[(r, c)] = esc(tidy_formula(fml))
-                occ.add(c)
-                rs, cs = spans.get((r, c), (1, 1))
-                for cc in range(c, min(c + cs, max_col + 1)):
-                    occ.add(cc)
+                put(esc(tidy_formula(fml)), tidy_formula(fml))
                 continue
             hval = rich_text_html(cell.value)
             if hval is None:
                 text = format_cell_value(cell.value, cell.number_format)
                 hval = esc(text) if text != "" else ""
+                raw = text
+            else:
+                raw = _TAG_RE.sub("", hval)
             if hval == "":
                 continue
-            content[(r, c)] = hval
-            occ.add(c)
-            rs, cs = spans.get((r, c), (1, 1))
-            for cc in range(c, min(c + cs, max_col + 1)):
-                occ.add(cc)
+            put(hval, raw)
         occupied[r] = occ
 
     def has_border(r: int, c: int, side: str) -> bool:
@@ -1771,6 +1795,15 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                     if blocked:
                         limit = f' style="max-width:{own + avail:.0f}px"'
                         kls = " cr"
+                # はみ出す見込みがあるセルに印を付ける。Excel では、はみ出した文字は
+                # 通り道の目盛線を消すので、実際にどこまで届くかの実測は
+                # ブラウザ側（mark()）に任せる。ov=右へ / ovl=左へ / ovc=両側へ
+                if gridlines:
+                    fpt = float(cell.font.sz or 11) if cell.font else 11.0
+                    if est_text_px(plain.get((r, c), ""), fpt,
+                                   bool(cell.font and cell.font.b)) > own - 2 * CELL_PAD:
+                        kls += {"right": " ovl", "center": " ovc",
+                                "centerContinuous": " ovc"}.get(halign, " ov")
             if kls:
                 kls = f' class="{kls.strip()}"'
 
@@ -2066,6 +2099,9 @@ td.hidden{border:none!important;font-size:0}
 td>i{font-style:normal;display:inline-block;z-index:1;padding:0 %(pad)spx;
   overflow:hidden;pointer-events:auto}
 td>i.cr{display:flex;justify-content:flex-end}
+/* Excel と同じく、塗りやはみ出した文字が通った目盛線は消える。
+   --glr/--glb は目盛線の色だけを差し替える穴なので、本物の罫線には影響しない */
+td.ngr{--glr:transparent}
 /* 見切れているセル: クリックで全文表示を固定、もう一度クリックで元に戻す。
    切れている文字も DOM 上には残っているので、開かなくても選択コピー・検索はできる。 */
 td>i.on{cursor:zoom-in}
@@ -2131,15 +2167,36 @@ function mark(sh){
   if(!sh||sh.dataset.marked||!sh.classList.contains('on'))return;
   sh.dataset.marked='1';
   // 右揃えの見切れは scrollWidth に出ないので、制限を外した幅と比べて判定する
-  var cand=[].slice.call(sh.querySelectorAll('td>i.c,td>i.cr'));
+  var cand=[].slice.call(sh.querySelectorAll('td>i.c,td>i.cr,td>i.ov,td>i.ovl,td>i.ovc'));
   var lim=cand.map(function(el){return parseFloat(el.style.maxWidth)||0});
   sh.classList.add('measuring');
-  var nat=cand.map(function(el){return el.getBoundingClientRect().width});
+  var box=cand.map(function(el){return el.getBoundingClientRect()});
   sh.classList.remove('measuring');
-  cand.forEach(function(el,i){if(lim[i]&&nat[i]>lim[i]+2)el.classList.add('on')});
+  cand.forEach(function(el,i){if(lim[i]&&box[i].width>lim[i]+2)el.classList.add('on')});
   sh.querySelectorAll('td>i.cw').forEach(function(el){
     if(el.scrollHeight>el.clientHeight+2||el.scrollWidth>el.clientWidth+2)el.classList.add('on');
   });
+  // Excel でははみ出した文字が通り道の目盛線を消す。文字がどこまで届くかは
+  // フォント次第なので、ここで実測してから消す。読み取りを全部済ませてから
+  // まとめて書き込み、レイアウトの往復を避ける。
+  var kill=[];
+  cand.forEach(function(el,i){
+    var cl=el.classList;
+    var toR=cl.contains('ov')||cl.contains('ovc'), toL=cl.contains('ovl')||cl.contains('ovc');
+    if(!toR&&!toL)return;
+    var td=el.parentNode, cb=td.getBoundingClientRect(), lo=box[i].left+2, hi=box[i].right-2;
+    if(lim[i]){                       // 見切れているセルは切れた先までしか消さない
+      if(cl.contains('ovc')){var mid=(cb.left+cb.right)/2;
+        lo=Math.max(lo,mid-lim[i]/2); hi=Math.min(hi,mid+lim[i]/2);}
+      else if(cl.contains('ovl')) lo=Math.max(lo,cb.right-lim[i]);
+      else hi=Math.min(hi,cb.left+lim[i]);
+    }
+    var t;
+    if(toR){t=td; while(t&&t.getBoundingClientRect().right<hi){kill.push(t);t=t.nextElementSibling;}}
+    if(toL){t=td.previousElementSibling;
+      while(t&&t.getBoundingClientRect().right>lo){kill.push(t);t=t.previousElementSibling;}}
+  });
+  kill.forEach(function(t){t.classList.add('ngr')});
 }
 document.querySelectorAll('.tabs button').forEach(function(b){
   b.addEventListener('click',function(){
