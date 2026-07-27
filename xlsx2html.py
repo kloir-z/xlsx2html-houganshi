@@ -807,13 +807,33 @@ class DrawingParser:
         r, g, b = colorsys.hls_to_rgb(h, l, s)
         return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
 
+    def _style_color(self, style, tag: str) -> str | None:
+        """<a:fillRef>/<a:lnRef> の色。idx="0" は『なし』を意味するので色を返さない。"""
+        if style is None:
+            return None
+        ref = style.find(f"{{{A_NS}}}{tag}")
+        if ref is None:
+            return None
+        try:
+            if int(ref.get("idx") or 0) == 0:
+                return None            # idx=0 = 塗りなし／線なし
+        except ValueError:
+            pass
+        return self._color_of(ref)
+
     def _shape(self, node, box) -> dict:
         sp_pr = node.find(f"{{{XDR}}}spPr")
         prst = "rect"
+        adj: dict[str, float] = {}
         if sp_pr is not None:
             geom = sp_pr.find(f"{{{A_NS}}}prstGeom")
             if geom is not None:
                 prst = geom.get("prst") or "rect"
+                for gd in geom.findall(f"{{{A_NS}}}avLst/{{{A_NS}}}gd"):
+                    name, fmla = gd.get("name"), gd.get("fmla") or ""
+                    m = re.match(r"val\s+(-?\d+)", fmla)
+                    if name and m:
+                        adj[name] = int(m.group(1)) / 100000.0
             elif sp_pr.find(f"{{{A_NS}}}custGeom") is not None:
                 prst = "rect"
         # 塗り
@@ -854,20 +874,24 @@ class DrawingParser:
                 line_dash = d.get("val")
             he = ln.find(f"{{{A_NS}}}headEnd")
             te = ln.find(f"{{{A_NS}}}tailEnd")
-            head_end = he.get("type") if he is not None else None
-            tail_end = te.get("type") if te is not None else None
+            head_end = (he.get("type"), he.get("w"), he.get("len")) if he is not None else None
+            tail_end = (te.get("type"), te.get("w"), te.get("len")) if te is not None else None
         # スタイル参照（既定色）
         style = node.find(f"{{{XDR}}}style")
         if style is not None:
             if not has_explicit_fill:
-                fill = self._color_of(style.find(f"{{{A_NS}}}fillRef"))
+                fill = self._style_color(style, "fillRef")
             if not has_explicit_line and line_color is None:
-                line_color = self._color_of(style.find(f"{{{A_NS}}}lnRef"))
+                line_color = self._style_color(style, "lnRef")
         if not has_explicit_fill and fill is None and style is None:
+            fill = None
+        # 線・コネクタは決して塗らない。スタイル参照の fillRef を拾ってしまうと、
+        # 開いたパスが SVG で塗り潰されて巨大な色の塊になる。
+        if is_line_shape(prst):
             fill = None
         flip_h, flip_v = self._flips(node)
         return {
-            "kind": "shape", "box": box, "prst": prst, "fill": fill,
+            "kind": "shape", "box": box, "prst": prst, "fill": fill, "adj": adj,
             "line": line_color, "line_w": max(line_w, 0.5) if line_color else 0,
             "dash": line_dash, "rot": self._rotation(node),
             "flip_h": flip_h, "flip_v": flip_v,
@@ -922,60 +946,191 @@ class DrawingParser:
         return {"paras": paras, "anchor": anchor, "vert": vert}
 
 
+# 線・コネクタ系（閉じたパスではないので、塗ってはいけない図形）
+LINE_PRESETS = {"line", "straightConnector1"}
+
+
+def is_line_shape(prst: str) -> bool:
+    return prst in LINE_PRESETS or prst.startswith(("bentConnector", "curvedConnector"))
+
+
+def _pts(seq) -> str:
+    return "M" + " L".join(f"{x:.2f},{y:.2f}" for x, y in seq) + " Z"
+
+
+def _conn_path(prst: str, W: float, H: float, adj: dict) -> str | None:
+    """カギ線／曲線コネクタ。OOXML の調整値（折れ位置）に従う。"""
+    a1 = adj.get("adj1", 0.5)
+    a2 = adj.get("adj2", 0.5)
+    a3 = adj.get("adj3", 0.5)
+    if prst in ("bentConnector2", "curvedConnector2"):
+        pts = [(0, 0), (W, 0), (W, H)]
+    elif prst in ("bentConnector3", "curvedConnector3"):
+        x1 = W * a1
+        pts = [(0, 0), (x1, 0), (x1, H), (W, H)]
+    elif prst in ("bentConnector4", "curvedConnector4"):
+        x1, y2 = W * a1, H * a2
+        pts = [(0, 0), (x1, 0), (x1, y2), (W, y2), (W, H)]
+    elif prst in ("bentConnector5", "curvedConnector5"):
+        x1, y2, x3 = W * a1, H * a2, W * a3
+        pts = [(0, 0), (x1, 0), (x1, y2), (x3, y2), (x3, H), (W, H)]
+    else:
+        return None
+    if prst.startswith("bent"):
+        return "M" + " L".join(f"{x:.2f},{y:.2f}" for x, y in pts)
+    # 曲線コネクタ: 折れ点を二次ベジエの制御点にして角を丸める
+    d = [f"M{pts[0][0]:.2f},{pts[0][1]:.2f}"]
+    for i in range(1, len(pts) - 1):
+        px, py = pts[i - 1]
+        cx, cy = pts[i]
+        nx, ny = pts[i + 1]
+        d.append(f"Q{cx:.2f},{cy:.2f} {(cx+nx)/2:.2f},{(cy+ny)/2:.2f}")
+        pts[i] = ((cx + nx) / 2, (cy + ny) / 2)
+    d.append(f"L{pts[-1][0]:.2f},{pts[-1][1]:.2f}")
+    return " ".join(d)
+
+
 # 図形 → SVG パス（w,h は 100 正規化ではなく実寸で生成）
-def shape_path(prst: str, w: float, h: float) -> str | None:
-    W, H = w, h
-    a = min(W, H) * 0.35          # 矢印の軸太さ相当
+def shape_path(prst: str, w: float, h: float, adj: dict | None = None) -> str | None:
+    W, H, adj = w, h, adj or {}
+    ss = min(W, H)                       # OOXML の "ss"（短辺）
+    hc, vc = W / 2, H / 2
     if prst in ("line", "straightConnector1"):
-        return f"M0,0 L{W},{H}"
-    if prst in ("triangle", "isoscelesTriangle"):
-        return f"M{W/2},0 L{W},{H} L0,{H} Z"
+        return f"M0,0 L{W:.2f},{H:.2f}"
+    if is_line_shape(prst):
+        return _conn_path(prst, W, H, adj)
+    if prst in ("triangle", "isoscelesTriangle", "flowChartExtract"):
+        return _pts([(W * adj.get("adj", 0.5), 0), (W, H), (0, H)])
     if prst == "rtTriangle":
-        return f"M0,0 L0,{H} L{W},{H} Z"
-    if prst == "diamond":
-        return f"M{W/2},0 L{W},{H/2} L{W/2},{H} L0,{H/2} Z"
-    if prst == "parallelogram":
-        d = W * 0.25
-        return f"M{d},0 L{W},0 L{W-d},{H} L0,{H} Z"
+        return _pts([(0, 0), (0, H), (W, H)])
+    if prst in ("diamond", "flowChartDecision"):
+        return _pts([(hc, 0), (W, vc), (hc, H), (0, vc)])
+    if prst in ("parallelogram", "flowChartInputOutput"):
+        d = min(W * adj.get("adj", 0.25), W)
+        return _pts([(d, 0), (W, 0), (W - d, H), (0, H)])
     if prst == "trapezoid":
-        d = W * 0.25
-        return f"M{d},0 L{W-d},0 L{W},{H} L0,{H} Z"
+        d = min(W * adj.get("adj", 0.25), hc)
+        return _pts([(d, 0), (W - d, 0), (W, H), (0, H)])
     if prst == "hexagon":
-        d = W * 0.25
-        return f"M{d},0 L{W-d},0 L{W},{H/2} L{W-d},{H} L{d},{H} L0,{H/2} Z"
-    if prst == "pentagon" or prst == "homePlate":
-        d = W * 0.25
-        return f"M0,0 L{W-d},0 L{W},{H/2} L{W-d},{H} L0,{H} Z"
+        d = min(ss * adj.get("adj", 0.25), hc)
+        return _pts([(d, 0), (W - d, 0), (W, vc), (W - d, H), (d, H), (0, vc)])
+    if prst == "pentagon":                 # 正五角形（ホームベースは homePlate）
+        return _pts([(hc + math.cos(-math.pi / 2 + i * 2 * math.pi / 5) * hc,
+                      vc + math.sin(-math.pi / 2 + i * 2 * math.pi / 5) * vc)
+                     for i in range(5)])
+    if prst == "homePlate":
+        d = min(ss * adj.get("adj", 0.16667), W)
+        return _pts([(0, 0), (W - d, 0), (W, vc), (W - d, H), (0, H)])
     if prst == "chevron":
-        d = W * 0.25
-        return f"M0,0 L{W-d},0 L{W},{H/2} L{W-d},{H} L0,{H} L{d},{H/2} Z"
-    if prst == "rightArrow":
-        return (f"M0,{H/2-a/2} L{W-H*0.4},{H/2-a/2} L{W-H*0.4},0 L{W},{H/2} "
-                f"L{W-H*0.4},{H} L{W-H*0.4},{H/2+a/2} L0,{H/2+a/2} Z")
-    if prst == "leftArrow":
-        return (f"M{W},{H/2-a/2} L{H*0.4},{H/2-a/2} L{H*0.4},0 L0,{H/2} "
-                f"L{H*0.4},{H} L{H*0.4},{H/2+a/2} L{W},{H/2+a/2} Z")
-    if prst == "downArrow":
-        b = min(W, H) * 0.35
-        return (f"M{W/2-b/2},0 L{W/2+b/2},0 L{W/2+b/2},{H-W*0.4} L{W},{H-W*0.4} "
-                f"L{W/2},{H} L0,{H-W*0.4} L{W/2-b/2},{H-W*0.4} Z")
-    if prst == "upArrow":
-        b = min(W, H) * 0.35
-        return (f"M{W/2},0 L{W},{W*0.4} L{W/2+b/2},{W*0.4} L{W/2+b/2},{H} "
-                f"L{W/2-b/2},{H} L{W/2-b/2},{W*0.4} L0,{W*0.4} Z")
+        d = min(ss * adj.get("adj", 0.5), W)
+        return _pts([(0, 0), (W - d, 0), (W, vc), (W - d, H), (0, H), (d, vc)])
+    if prst == "octagon":
+        d = min(ss * adj.get("adj", 0.29289), hc, vc)
+        return _pts([(d, 0), (W - d, 0), (W, d), (W, H - d), (W - d, H),
+                     (d, H), (0, H - d), (0, d)])
+
+    # --- ブロック矢印 -------------------------------------------------------
+    # OOXML: adj1 = 軸の太さ（短辺比）, adj2 = 矢尻の長さ（短辺比）
+    if prst in ("rightArrow", "leftArrow", "notchedRightArrow", "stripedRightArrow",
+                "swooshArrow"):
+        dy = ss * min(max(adj.get("adj1", 0.5), 0.0), 1.0) / 2      # 軸の半分の太さ
+        dx = min(ss * max(adj.get("adj2", 0.5), 0.0), W)            # 矢尻の長さ
+        if prst == "leftArrow":
+            p = [(W, vc - dy), (dx, vc - dy), (dx, 0), (0, vc),
+                 (dx, H), (dx, vc + dy), (W, vc + dy)]
+        else:
+            x2 = W - dx
+            p = [(0, vc - dy), (x2, vc - dy), (x2, 0), (W, vc),
+                 (x2, H), (x2, vc + dy), (0, vc + dy)]
+            if prst == "notchedRightArrow":
+                p.append((dx * dy / vc if vc else 0, vc))           # 尾のえぐり
+        return _pts(p)
+    if prst in ("upArrow", "downArrow"):
+        dx = ss * min(max(adj.get("adj1", 0.5), 0.0), 1.0) / 2
+        dy = min(ss * max(adj.get("adj2", 0.5), 0.0), H)
+        if prst == "upArrow":
+            return _pts([(hc, 0), (W, dy), (hc + dx, dy), (hc + dx, H),
+                         (hc - dx, H), (hc - dx, dy), (0, dy)])
+        return _pts([(hc - dx, 0), (hc + dx, 0), (hc + dx, H - dy), (W, H - dy),
+                     (hc, H), (0, H - dy), (hc - dx, H - dy)])
     if prst == "leftRightArrow":
-        return (f"M0,{H/2} L{H*0.4},0 L{H*0.4},{H/2-a/2} L{W-H*0.4},{H/2-a/2} "
-                f"L{W-H*0.4},0 L{W},{H/2} L{W-H*0.4},{H} L{W-H*0.4},{H/2+a/2} "
-                f"L{H*0.4},{H/2+a/2} L{H*0.4},{H} Z")
-    if prst == "star5":
+        dy = ss * min(max(adj.get("adj1", 0.5), 0.0), 1.0) / 2
+        dx = min(ss * max(adj.get("adj2", 0.5), 0.0), hc)
+        return _pts([(0, vc), (dx, 0), (dx, vc - dy), (W - dx, vc - dy), (W - dx, 0),
+                     (W, vc), (W - dx, H), (W - dx, vc + dy), (dx, vc + dy), (dx, H)])
+    if prst == "upDownArrow":
+        dx = ss * min(max(adj.get("adj1", 0.5), 0.0), 1.0) / 2
+        dy = min(ss * max(adj.get("adj2", 0.5), 0.0), vc)
+        return _pts([(hc, 0), (W, dy), (hc + dx, dy), (hc + dx, H - dy), (W, H - dy),
+                     (hc, H), (0, H - dy), (hc - dx, H - dy), (hc - dx, dy), (0, dy)])
+    if prst == "quadArrow":
+        hh = ss * adj.get("adj1", 0.22) / 2       # 軸の半分の太さ
+        hd = ss * adj.get("adj2", 0.22)           # 矢尻の半幅
+        hl = ss * adj.get("adj3", 0.25)           # 矢尻の長さ
+        return _pts([
+            (hc, 0), (hc + hd, hl), (hc + hh, hl), (hc + hh, vc - hh),
+            (W - hl, vc - hh), (W - hl, vc - hd), (W, vc), (W - hl, vc + hd),
+            (W - hl, vc + hh), (hc + hh, vc + hh), (hc + hh, H - hl), (hc + hd, H - hl),
+            (hc, H), (hc - hd, H - hl), (hc - hh, H - hl), (hc - hh, vc + hh),
+            (hl, vc + hh), (hl, vc + hd), (0, vc), (hl, vc - hd), (hl, vc - hh),
+            (hc - hh, vc - hh), (hc - hh, hl), (hc - hd, hl)])
+    if prst == "leftRightUpArrow":
+        hh = ss * adj.get("adj1", 0.22) / 2
+        hd = ss * adj.get("adj2", 0.22)
+        hl = ss * adj.get("adj3", 0.25)
+        return _pts([
+            (hc, 0), (hc + hd, hl), (hc + hh, hl), (hc + hh, H - 2 * hh),
+            (W - hl, H - 2 * hh), (W - hl, H - 2 * hh - hd + hh), (W, H - hh),
+            (W - hl, H), (W - hl, H - hh + hh), (hl, H), (hl, H - hh + hh),
+            (0, H - hh), (hl, H - 2 * hh - hd + hh), (hl, H - 2 * hh),
+            (hc - hh, H - 2 * hh), (hc - hh, hl), (hc - hd, hl)])
+    if prst in ("bentArrow", "bentUpArrow"):
+        th = ss * adj.get("adj1", 0.25)           # 軸の太さ
+        hl = ss * adj.get("adj4", 0.4)            # 矢尻の長さ
+        hw = th                                    # 矢尻の張り出し
+        cx = W - hw - th / 2
+        return _pts([(0, H - th), (cx - th / 2, H - th), (cx - th / 2, hl),
+                     (cx - hw - th / 2, hl), (cx, 0), (cx + hw + th / 2, hl),
+                     (cx + th / 2, hl), (cx + th / 2, H), (0, H)])
+    if prst == "uturnArrow":
+        th = ss * adj.get("adj1", 0.25)
+        hl = ss * adj.get("adj4", 0.4)
+        hw = th
+        ro = (W - hw) / 2                          # 外側の折り返し半径
+        ri = max(ro - th, 0.5)
+        ay = min(ro, H - hl)                       # 円弧の中心 y
+        return (f"M0,{H:.2f} L0,{ay:.2f} "
+                f"A{ro:.2f},{ro:.2f} 0 0 1 {2*ro:.2f},{ay:.2f} "
+                f"L{2*ro:.2f},{H-hl:.2f} L{2*ro+hw:.2f},{H-hl:.2f} "
+                f"L{2*ro-ri/1:.2f},{H:.2f} L{2*ro-th-hw:.2f},{H-hl:.2f} "
+                f"L{2*ro-th:.2f},{H-hl:.2f} L{2*ro-th:.2f},{ay:.2f} "
+                f"A{ri:.2f},{ri:.2f} 0 0 0 {th:.2f},{ay:.2f} L{th:.2f},{H:.2f} Z")
+    if prst in ("curvedRightArrow", "curvedLeftArrow", "curvedUpArrow", "curvedDownArrow"):
+        # 円弧に沿った矢印。縦向きは横向きを作って 90 度入れ替える
+        vert = prst in ("curvedUpArrow", "curvedDownArrow")
+        A, B = (H, W) if vert else (W, H)
+        th = min(A, B) * adj.get("adj1", 0.25)
+        hl = min(A, B) * adj.get("adj3", 0.5)
+        ro, ri = B / 2, max(B / 2 - th, 0.5)
+        xa = max(A - hl, 0.1)
+        pt = [(0, ro - th), (xa, ro - th), (xa, ro - th - th / 2), (A, ro),
+              (xa, ro + th + th / 2), (xa, ro + th), (0, ro + th)]
+        if vert:
+            pt = [(y, x) for x, y in pt]
+        if prst in ("curvedLeftArrow", "curvedUpArrow"):
+            pt = [(W - x, y) if not vert else (x, H - y) for x, y in pt]
+        return _pts(pt)
+
+    if prst in ("star4", "star5", "star6", "star8", "star10", "star12", "star16",
+                "star24", "star32"):
+        n = int(prst[4:])
+        inner = {4: 0.16, 5: 0.19, 6: 0.28, 8: 0.37}.get(n, 0.42)
         pts = []
-        for i in range(10):
-            ang = -math.pi / 2 + i * math.pi / 5
-            r = 0.5 if i % 2 == 0 else 0.2
-            pts.append(f"{W/2 + math.cos(ang)*W*r},{H/2 + math.sin(ang)*H*r}")
-        return "M" + " L".join(pts) + " Z"
-    if prst.startswith("bentConnector") or prst.startswith("curvedConnector"):
-        return f"M0,0 L{W/2},0 L{W/2},{H} L{W},{H}"
+        for i in range(n * 2):
+            ang = -math.pi / 2 + i * math.pi / n
+            r = 0.5 if i % 2 == 0 else inner
+            pts.append((hc + math.cos(ang) * W * r, vc + math.sin(ang) * H * r))
+        return _pts(pts)
     return None
 
 
@@ -1646,6 +1801,51 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
             "cols": max_col - min_col + 1}
 
 
+# 矢尻の大きさ（OOXML の sm / med / lg）。線幅の倍数で効く
+ARROW_SCALE = {"sm": 0.7, "med": 1.0, "lg": 1.4}
+
+
+def arrow_marker(uid: str, end, color: str, at_end: bool) -> str:
+    """<a:headEnd>/<a:tailEnd> → SVG の <marker>。返り値が空なら矢尻なし。"""
+    if not end:
+        return ""
+    kind, wv, lv = end if isinstance(end, tuple) else (end, None, None)
+    if not kind or kind == "none":
+        return ""
+    fw = 5.0 * ARROW_SCALE.get(wv or "med", 1.0)      # 幅（線幅の倍数）
+    fl = 5.0 * ARROW_SCALE.get(lv or "med", 1.0)      # 長さ
+    cy = fw / 2
+    # marker の座標系は「線の進行方向 = +x」。終端は先端を右に、始端は左に置く
+    if kind == "triangle":
+        d, fillmode = f"M0,0 L{fl},{cy} L0,{fw} Z", "fill"
+    elif kind == "stealth":
+        d, fillmode = f"M0,0 L{fl},{cy} L0,{fw} L{fl*0.35:.2f},{cy} Z", "fill"
+    elif kind == "arrow":
+        d, fillmode = f"M0,0 L{fl},{cy} L0,{fw}", "stroke"
+    elif kind == "diamond":
+        d, fillmode = (f"M0,{cy} L{fl/2:.2f},0 L{fl},{cy} L{fl/2:.2f},{fw} Z", "fill")
+    elif kind == "oval":
+        d, fillmode = "", "oval"
+    else:
+        d, fillmode = f"M0,0 L{fl},{cy} L0,{fw} Z", "fill"
+
+    if fillmode == "oval":
+        shape = (f'<circle cx="{fl/2:.2f}" cy="{cy:.2f}" r="{min(fl,fw)/2:.2f}" '
+                 f'fill="{color}"/>')
+    elif fillmode == "stroke":
+        shape = f'<path d="{d}" fill="none" stroke="{color}" stroke-width="1"/>'
+    else:
+        shape = f'<path d="{d}" fill="{color}"/>'
+    # 先端がちょうど線の端点に来るよう refX を合わせる
+    ref_x = fl if at_end else 0.0
+    tr = "" if at_end else f' transform="rotate(180 {fl/2:.2f} {cy:.2f})"'
+    if tr:
+        ref_x = 0.0
+    return (f'<marker id="{uid}" markerWidth="{fl:.2f}" markerHeight="{fw:.2f}" '
+            f'refX="{ref_x:.2f}" refY="{cy:.2f}" orient="auto">'
+            f'<g{tr}>{shape}</g></marker>')
+
+
 def render_shape(s: dict) -> str:
     x, y, w, h = s["box"]
     w = max(w, 1.0)
@@ -1659,13 +1859,14 @@ def render_shape(s: dict) -> str:
         return (f'<img class="dobj" style="{base}" src="{s["src"]}" alt="{alt}">')
 
     prst = s.get("prst", "rect")
-    path = shape_path(prst, w, h)
+    path = shape_path(prst, w, h, s.get("adj"))
     fill, line, lw = s.get("fill"), s.get("line"), s.get("line_w") or 0
     dash = s.get("dash")
     body = []
 
-    is_line = prst in ("line", "straightConnector1") or prst.startswith(("bentConnector",
-                                                                        "curvedConnector"))
+    is_line = is_line_shape(prst)
+    if is_line:
+        fill = None                 # 開いたパスなので塗ると塊になる
     if path is not None:
         stroke = line or ("#000000" if is_line else "none")
         sw = lw if lw else (1 if is_line else 0)
@@ -1685,13 +1886,13 @@ def render_shape(s: dict) -> str:
         marker = ""
         defs = ""
         uid = f"m{abs(hash((x, y, w, h, prst))) % 100000}"
-        if s.get("tail") and s["tail"] != "none":
-            defs += (f'<marker id="{uid}t" markerWidth="6" markerHeight="6" refX="5" refY="3" '
-                     f'orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="{line or "#000"}"/></marker>')
+        d = arrow_marker(f"{uid}t", s.get("tail"), line or "#000", True)
+        if d:
+            defs += d
             marker += f' marker-end="url(#{uid}t)"'
-        if s.get("head") and s["head"] != "none":
-            defs += (f'<marker id="{uid}h" markerWidth="6" markerHeight="6" refX="1" refY="3" '
-                     f'orient="auto"><path d="M6,0 L0,3 L6,6 Z" fill="{line or "#000"}"/></marker>')
+        d = arrow_marker(f"{uid}h", s.get("head"), line or "#000", False)
+        if d:
+            defs += d
             marker += f' marker-start="url(#{uid}h)"'
         body.append(
             f'<svg class="dsvg" width="{w:.1f}" height="{h:.1f}" viewBox="0 0 {w:.1f} {h:.1f}" '
