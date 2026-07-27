@@ -387,6 +387,21 @@ _DATE_TOKEN_RE = re.compile(
     r'\[h+\]|\[m+\]|\[s+\]|"[^"]*"|\\.|am/pm|a/p|ggge|gge|ge|g+|yyyy|yyyy|yy|mmmmm|mmmm|mmm|mm|m|'
     r'dddd|ddd|dd|d|aaaa|aaa|hh|h|ss|s|\.0+|e+|.', re.IGNORECASE)
 
+# 上の並びのうち「書式コード」であるもの。区切り記号やリテラルと区別するのに使う
+_DATE_FIELD_RE = re.compile(
+    r'\[h+\]|\[m+\]|\[s+\]|am/pm|a/p|g+|y+|m+|d+|a{3,4}|h{1,2}|s{1,2}|e+|\.0+',
+    re.IGNORECASE)
+
+
+def _neighbour_code(low: list[str], idx: int, step: int) -> str:
+    """区切り記号やリテラルを読み飛ばして、隣にある書式コードを返す。"""
+    k = idx + step
+    while 0 <= k < len(low):
+        if _DATE_FIELD_RE.fullmatch(low[k]):
+            return low[k]
+        k += step
+    return ""
+
 
 def format_datetime(value, fmt: str) -> str:
     if isinstance(value, timedelta):
@@ -433,8 +448,10 @@ def format_datetime(value, fmt: str) -> str:
                 out.append(f"{int(total_seconds) % 60:0{len(t)}d}"); continue
             out.append(tok); continue
 
-        if t.startswith("[h"):
-            out.append(str(int((dt - datetime(1899, 12, 30)).total_seconds() // 3600))); continue
+        if t.startswith("[h") or t.startswith("[m") or t.startswith("[s"):
+            secs = (dt - datetime(1899, 12, 30)).total_seconds()
+            div = 3600 if t.startswith("[h") else 60 if t.startswith("[m") else 1
+            out.append(str(int(secs // div))); continue
         if t in ("yyyy",):
             out.append(f"{dt.year:04d}"); continue
         if t == "yy":
@@ -459,12 +476,12 @@ def format_datetime(value, fmt: str) -> str:
             out.append({"mmmmm": dt.strftime("%b")[0], "mmmm": dt.strftime("%B"),
                         "mmm": dt.strftime("%b")}[t]); continue
         if t in ("m", "mm"):
-            # 直前が時、直後が秒なら「分」
-            prev = next((low[k] for k in range(idx - 1, -1, -1)
-                         if not low[k].startswith('"')), "")
-            nxt = next((low[k] for k in range(idx + 1, len(low))
-                        if not low[k].startswith('"')), "")
-            is_minute = prev in ("h", "hh", "[h]") or nxt in ("s", "ss")
+            # Excel の規則: 時の直後、または秒の直前にある m は「月」ではなく「分」。
+            # h:mm の ":" のような区切り記号やリテラルは間にあっても隣とみなす
+            prev = _neighbour_code(low, idx, -1)
+            nxt = _neighbour_code(low, idx, 1)
+            is_minute = (prev in ("h", "hh") or prev.startswith("[h")
+                         or nxt in ("s", "ss") or nxt.startswith("[s"))
             v = dt.minute if is_minute else dt.month
             out.append(f"{v:0{len(t)}d}"); continue
         if t in ("h", "hh"):
