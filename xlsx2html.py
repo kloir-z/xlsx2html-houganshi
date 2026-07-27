@@ -45,6 +45,47 @@ except ImportError:  # pragma: no cover
     sys.exit("openpyxl が必要です:  pip install openpyxl")
 
 
+# 日本語版 Excel が使う組み込み表示形式（numFmtId 27-36, 50-58）を openpyxl は
+# 知らず、General として扱ってしまう。すると日付セルが datetime に変換されず、
+# 46255 のようなシリアル値がそのまま表示される。読み込む前に補っておく。
+# これらの ID の意味はロケール依存で、下表は日本語ロケール(LCID 0x411)のもの。
+JP_BUILTIN_FORMATS = {
+    27: '[$-411]ge.m.d',
+    28: '[$-411]ggge"年"m"月"d"日"',
+    29: '[$-411]ggge"年"m"月"d"日"',
+    30: "m/d/yy",
+    31: 'yyyy"年"m"月"d"日"',
+    32: 'h"時"mm"分"',
+    33: 'h"時"mm"分"ss"秒"',
+    34: 'yyyy"年"m"月"',
+    35: 'm"月"d"日"',
+    36: '[$-411]ge.m.d',
+    50: '[$-411]ge.m.d',
+    51: '[$-411]ggge"年"m"月"d"日"',
+    52: 'yyyy"年"m"月"',
+    53: 'm"月"d"日"',
+    54: '[$-411]ggge"年"m"月"d"日"',
+    55: 'yyyy"年"m"月"',
+    56: 'm"月"d"日"',
+    57: '[$-411]ge.m.d',
+    58: '[$-411]ggge"年"m"月"d"日"',
+}
+
+try:
+    from openpyxl.styles import numbers as _opx_numbers
+    from openpyxl.styles.numbers import is_date_format, is_timedelta_format
+    from openpyxl.utils.datetime import WINDOWS_EPOCH, from_excel
+
+    # 辞書を差し替えるのではなく、その場に足す。openpyxl 側は
+    # builtin_format_code() 経由でこの辞書を都度引くので、これで効く。
+    for _id, _code in JP_BUILTIN_FORMATS.items():
+        _opx_numbers.BUILTIN_FORMATS.setdefault(_id, _code)
+except Exception:  # pragma: no cover - openpyxl の内部構成が変わった場合
+    is_date_format = is_timedelta_format = None
+    WINDOWS_EPOCH = datetime(1899, 12, 30)
+    from_excel = None
+
+
 # ---------------------------------------------------------------------------
 # 単位換算
 # ---------------------------------------------------------------------------
@@ -419,6 +460,17 @@ def format_datetime(value, fmt: str) -> str:
             return str(value)
         total_seconds = None
 
+    if not (fmt or "").strip() or fmt.strip().lower() == "general":
+        # 表示形式が無い日付。Excel はシリアル値を出すが、読める方が役に立つ
+        if dt is None:
+            fmt = "[h]:mm:ss"
+        elif isinstance(value, time):
+            fmt = "h:mm:ss"
+        elif dt.hour or dt.minute or dt.second:
+            fmt = "yyyy/m/d h:mm:ss"
+        else:
+            fmt = "yyyy/m/d"
+
     fmt = _strip_brackets_keep_elapsed(fmt or "")
     sections = _split_sections(fmt)
     fmt = sections[0] if sections else fmt
@@ -518,7 +570,23 @@ def _era_year(d: date) -> int:
     return y
 
 
-def format_cell_value(value, number_format: str) -> str:
+def serial_to_datetime(value: float, number_format: str, epoch=None):
+    """日付書式なのに数値のまま残っているセルを日付に直す（保険）。
+
+    openpyxl は表示形式を見て日付セルを datetime に変換してくれるが、知らない
+    組み込み書式があると素通しになる。そのまま数値として出すと 46255 のような
+    シリアル値が見えてしまうので、こちらでも判定して変換する。
+    """
+    if from_excel is None or not number_format or not is_date_format(number_format):
+        return None
+    try:
+        return from_excel(value, epoch or WINDOWS_EPOCH,
+                          timedelta=is_timedelta_format(number_format))
+    except (OverflowError, ValueError):
+        return None
+
+
+def format_cell_value(value, number_format: str, epoch=None) -> str:
     if value is None:
         return ""
     if isinstance(value, bool):
@@ -526,6 +594,9 @@ def format_cell_value(value, number_format: str) -> str:
     if isinstance(value, (datetime, date, time, timedelta)):
         return format_datetime(value, number_format)
     if isinstance(value, (int, float)):
+        dt = serial_to_datetime(float(value), number_format, epoch)
+        if dt is not None:
+            return format_datetime(dt, number_format)
         return format_number(float(value), number_format)
     return str(value)
 
@@ -2697,6 +2768,7 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
     styles = StyleSheet(resolver, gridlines)
     page_breaks = page_breaks or set()
     cfmap = cond.map if cond is not None else {}
+    epoch = getattr(ws.parent, "epoch", None)     # 1904 年基準のブックがある
 
     # 結合セル（印刷範囲で切った場合は、はみ出した分を詰めて表示する）
     covered: dict[tuple[int, int], tuple[int, int]] = {}
@@ -2759,7 +2831,7 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
             if hval is None:
                 cfx = cfmap.get((sr, sc))
                 nfmt = (cfx or {}).get("numfmt") or cell.number_format
-                text = format_cell_value(cell.value, nfmt)
+                text = format_cell_value(cell.value, nfmt, epoch)
                 hval = esc(text) if text != "" else ""
                 raw = text
             else:
@@ -3468,6 +3540,8 @@ def diagnose(src: str, opts) -> None:
         else:
             print("   保存値が縦に不自然な形で揃っている箇所はありません")
 
+    diagnose_formats(wb_v, targets)
+
     print(f"\n── 全体: 数式 {tot['f']} 個"
           f" / 計算結果なし {tot['none']} 個 / エラー値 {tot['err']} 個"
           f" / 数値 {tot['num']} 個 / 文字列 {tot['str']} 個")
@@ -3479,6 +3553,48 @@ def diagnose(src: str, opts) -> None:
               "Excel で開いて上書き保存すると解消します。", file=sys.stderr)
     wb_v.close()
     wb_f.close()
+
+
+def diagnose_formats(wb, targets: list[str]) -> None:
+    """日付が数値のまま残っていないかを表示形式ごとに数える。
+
+    出すのは numFmtId と件数だけで、セルの中身も書式の文字列も出さない。
+    """
+    if is_date_format is None:
+        return
+    dated: dict[int, int] = {}          # numFmtId -> 日付として読めたセル数
+    raw: dict[int, int] = {}            # numFmtId -> 日付書式なのに数値のままのセル数
+    unknown: dict[int, int] = {}        # 表示形式そのものを解決できない numFmtId
+    for name in targets:
+        if name not in wb.sheetnames:
+            continue
+        for row in wb[name].iter_rows():
+            for cell in row:
+                v = cell.value
+                if v is None or isinstance(v, (bool, str)):
+                    continue
+                nid = getattr(getattr(cell, "_style", None), "numFmtId", 0)
+                if isinstance(v, (datetime, date, time, timedelta)):
+                    dated[nid] = dated.get(nid, 0) + 1
+                elif isinstance(v, (int, float)):
+                    if nid < 164 and nid not in _opx_numbers.BUILTIN_FORMATS:
+                        unknown[nid] = unknown.get(nid, 0) + 1
+                    elif is_date_format(cell.number_format):
+                        raw[nid] = raw.get(nid, 0) + 1
+
+    def ids(d: dict[int, int]) -> str:
+        return ", ".join(f"{k}({v}個)" for k, v in sorted(d.items()))
+
+    print("\n── 表示形式")
+    print(f"   日付・時刻として読めたセル: {sum(dated.values())} 個"
+          + (f"  numFmtId {ids(dated)}" if dated else ""))
+    if raw:
+        print(f"   ※ 日付書式なのに数値のまま残っているセル: {sum(raw.values())} 個"
+              f"  numFmtId {ids(raw)}")
+        print("     → 45000 前後のシリアル値がそのまま表示されます。この numFmtId を教えてください。")
+    if unknown:
+        print(f"   ※ 表示形式を解決できない numFmtId: {ids(unknown)}")
+        print("     → General 扱いになります。この numFmtId を教えてください。")
 
 
 def convert(src: str, dst: str, opts) -> str:
