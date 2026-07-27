@@ -384,7 +384,7 @@ def _sci(value: float, fmt: str) -> str:
 
 
 _DATE_TOKEN_RE = re.compile(
-    r'\[h+\]|\[m+\]|\[s+\]|"[^"]*"|\\.|am/pm|a/p|ggge|gge|ge|g+|yyyy|yyyy|yy|mmmmm|mmmm|mmm|mm|m|'
+    r'\[h+\]|\[m+\]|\[s+\]|"[^"]*"|\\.|am/pm|a/p|g+|yyyy|yy|mmmmm|mmmm|mmm|mm|m|'
     r'dddd|ddd|dd|d|aaaa|aaa|hh|h|ss|s|\.0+|e+|.', re.IGNORECASE)
 
 # 上の並びのうち「書式コード」であるもの。区切り記号やリテラルと区別するのに使う
@@ -456,12 +456,12 @@ def format_datetime(value, fmt: str) -> str:
             out.append(f"{dt.year:04d}"); continue
         if t == "yy":
             out.append(f"{dt.year % 100:02d}"); continue
-        if t in ("ggge", "gge", "ge", "g", "gg", "ggg"):
+        if t.startswith("g"):
+            # g=R / gg=令 / ggg=令和。年の数字は続く e が出すので、ここでは出さない
             era = _era(dt.date())
-            out.append({"ggge": era[1], "gge": era[2], "ge": era[3],
-                        "g": era[3], "gg": era[2], "ggg": era[1]}.get(t, era[1])); continue
+            out.append(era[3] if len(t) == 1 else era[2] if len(t) == 2 else era[1]); continue
         if t.startswith("e"):
-            out.append(str(_era_year(dt.date()))); continue
+            out.append(f"{_era_year(dt.date()):0{len(t)}d}"); continue
         if t == "aaaa":
             out.append(JP_WEEK[dt.weekday()] + "曜日"); continue
         if t == "aaa":
