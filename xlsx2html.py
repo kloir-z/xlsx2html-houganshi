@@ -1241,14 +1241,16 @@ class StyleSheet:
         self._by_style_key: dict[tuple, str] = {}
         self.rules: list[tuple[str, str, str]] = []
 
-    def class_for(self, cell, grid_r: bool = True, grid_b: bool = True) -> str:
+    def class_for(self, cell, grid_r: bool = True, grid_b: bool = True,
+                  cf: dict | None = None) -> str:
+        cfkey = cf_key(cf)
         try:
-            key = (tuple(cell._style), grid_r, grid_b)
+            key = (tuple(cell._style), grid_r, grid_b, cfkey)
         except Exception:
             key = None
         if key is not None and key in self._by_style_key:
             return self._by_style_key[key]
-        td, sp = self._build(cell, grid_r, grid_b)
+        td, sp = self._build(cell, grid_r, grid_b, cf)
         name = self._by_decl.get((td, sp))
         if name is None:
             name = f"s{len(self._by_decl)}"
@@ -1258,8 +1260,10 @@ class StyleSheet:
             self._by_style_key[key] = name
         return name
 
-    def _build(self, cell, grid_r: bool = True, grid_b: bool = True) -> tuple[str, str]:
+    def _build(self, cell, grid_r: bool = True, grid_b: bool = True,
+               cf: dict | None = None) -> tuple[str, str]:
         R = self.resolver
+        cf = cf or {}
         font, fill, border, al = cell.font, cell.fill, cell.border, cell.alignment
         td: list[str] = []
         sp: list[str] = []
@@ -1279,13 +1283,15 @@ class StyleSheet:
                     bg = mix(fg, bgc, ratio)
             elif fg:
                 bg = mix(fg, bgc, 0.5)
+        if cf.get("bg"):                       # 条件付き書式の塗りが優先
+            bg = cf["bg"]
         if bg:
-            td.append(f"background:{bg}")
+            td.append(f"background-color:{bg}")
 
         # --- 罫線 ---
-        for side, prop in (("top", "border-top"), ("bottom", "border-bottom"),
-                           ("left", "border-left"), ("right", "border-right")):
-            css = border_css(getattr(border, side, None), R) if border else None
+        for side, prop, cfk in (("top", "border-top", "bt"), ("bottom", "border-bottom", "bb"),
+                                ("left", "border-left", "bl"), ("right", "border-right", "br")):
+            css = cf.get(cfk) or (border_css(getattr(border, side, None), R) if border else None)
             if css:
                 td.append(f"{prop}:{css}")
             elif bg:
@@ -1314,29 +1320,40 @@ class StyleSheet:
                     diag_css.append(f"linear-gradient(to top right,transparent calc(50% - 0.5px),"
                                     f"{dcolor} calc(50% - 0.5px),{dcolor} calc(50% + 0.5px),"
                                     f"transparent calc(50% + 0.5px))")
-            if diag_css:
-                td.append("background-image:" + ",".join(diag_css))
+        else:
+            diag_css = []
+        # データバー（条件付き書式）。斜線より下に敷く
+        if cf.get("bar"):
+            color, pct, rtl = cf["bar"]
+            side = "left" if rtl else "right"
+            diag_css.append(f"linear-gradient(to {side},{color} 0 {pct:.1f}%,"
+                            f"transparent {pct:.1f}% 100%)")
+        if diag_css:
+            td.append("background-image:" + ",".join(diag_css))
 
-        # --- フォント ---
+        # --- フォント ---（条件付き書式の指定があればそちらが勝つ）
         if font is not None:
             if font.name:
                 td.append(f'font-family:"{font.name}",{FONT_FALLBACK}')
             if font.sz:
                 td.append(f"font-size:{font.sz}pt")
-            if font.b:
+            bold = cf["b"] if "b" in cf else bool(font.b)
+            ital = cf["i"] if "i" in cf else bool(font.i)
+            if bold:
                 td.append("font-weight:700")
-            if font.i:
+            if ital:
                 td.append("font-style:italic")
             deco = []
-            if font.u:
+            uline = cf["u"] if "u" in cf else font.u
+            if uline:
                 deco.append("underline")
-            if font.strike:
+            if cf["strike"] if "strike" in cf else font.strike:
                 deco.append("line-through")
             if deco:
                 td.append("text-decoration:" + " ".join(deco))
-                if font.u in ("double", "doubleAccounting"):
+                if uline in ("double", "doubleAccounting"):
                     td.append("text-decoration-style:double")
-            c = R.resolve(font.color)
+            c = cf.get("color") or R.resolve(font.color)
             if c:
                 td.append(f"color:{c}")
             if font.vertAlign == "superscript":
@@ -1581,6 +1598,1054 @@ def resolve_sheet_name_formulas(wb, formulas: dict[str, dict],
     return out
 
 
+# ---------------------------------------------------------------------------
+# 数式の簡易評価器（条件付き書式の判定に使う）
+#
+# 汎用の計算エンジンではない。「$E5="完了"」「MOD(ROW(),2)=1」「AND(...)」のような
+# 条件付き書式で実際に使われる式を評価できれば十分なので、評価できない式は
+# EvalError にして「ルール不成立」に倒す。
+# ---------------------------------------------------------------------------
+
+class _Blank:
+    __slots__ = ()
+
+    def __repr__(self):
+        return "<blank>"
+
+
+BLANK = _Blank()
+EXCEL_EPOCH = datetime(1899, 12, 30)
+
+
+class EvalError(Exception):
+    """評価できない式。呼び出し側はルール不成立として扱う。"""
+
+
+_F_TOKEN = re.compile(r"""
+    \s*(?:
+      (?P<str>"(?:[^"]|"")*")
+    | (?P<err>\#(?:VALUE!|REF!|DIV/0!|NAME\?|NULL!|NUM!|N/A|SPILL!|CALC!))
+    | (?P<func>[A-Za-z_][A-Za-z0-9_.]*)\s*\(
+    | (?P<sheet>(?:'(?:[^']|'')*'|[A-Za-z0-9_.-￿]+)!)
+    | (?P<bool>TRUE|FALSE)(?![A-Za-z0-9_])
+    | (?P<ref>\$?[A-Za-z]{1,3}\$?[1-9][0-9]*)(?![A-Za-z0-9_(])
+    | (?P<name>[A-Za-z_\\][A-Za-z0-9_.\\]*)
+    | (?P<num>(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?)
+    | (?P<op><>|<=|>=|[-+*/^&<>=(),:%])
+    )""", re.X)
+
+
+def _tokenize(s: str) -> list[tuple[str, str]]:
+    toks, i, n = [], 0, len(s)
+    while i < n:
+        if s[i].isspace():
+            i += 1
+            continue
+        m = _F_TOKEN.match(s, i)
+        if not m or m.end() == i:
+            raise EvalError(f"読めない文字: {s[i]!r}")
+        i = m.end()
+        toks.append((m.lastgroup, m.group(m.lastgroup)))
+    return toks
+
+
+def _serial(v) -> float:
+    if isinstance(v, datetime):
+        return (v - EXCEL_EPOCH).total_seconds() / 86400.0
+    if isinstance(v, date):
+        return float((datetime(v.year, v.month, v.day) - EXCEL_EPOCH).days)
+    if isinstance(v, time):
+        return (v.hour * 3600 + v.minute * 60 + v.second) / 86400.0
+    if isinstance(v, timedelta):
+        return v.total_seconds() / 86400.0
+    raise EvalError("日付として扱えない")
+
+
+def _num(v) -> float:
+    if v is BLANK or v is None:
+        return 0.0
+    if isinstance(v, bool):
+        return 1.0 if v else 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, (datetime, date, time, timedelta)):
+        return _serial(v)
+    if isinstance(v, str):
+        if v in ERROR_TEXTS:
+            raise EvalError(v)
+        try:
+            return float(v.strip())
+        except ValueError:
+            raise EvalError("数値にできない")
+    raise EvalError("数値にできない")
+
+
+def _text(v) -> str:
+    if v is BLANK or v is None:
+        return ""
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, float) and v == int(v):
+        return str(int(v))
+    return str(v)
+
+
+def _rank(v) -> int:
+    """Excel の型順: 数値 < 文字列 < FALSE < TRUE"""
+    if isinstance(v, bool):
+        return 3 if v else 2
+    if isinstance(v, str):
+        return 1
+    return 0
+
+
+def _compare(a, b) -> int:
+    if a is BLANK and b is BLANK:
+        return 0
+    if a is BLANK:
+        a = "" if isinstance(b, str) else (False if isinstance(b, bool) else 0)
+    if b is BLANK:
+        b = "" if isinstance(a, str) else (False if isinstance(a, bool) else 0)
+    ra, rb = _rank(a), _rank(b)
+    if ra != rb:
+        return -1 if ra < rb else 1
+    if ra == 1:
+        x, y = a.upper(), b.upper()
+        return (x > y) - (x < y)
+    if ra >= 2:
+        return 0
+    x, y = _num(a), _num(b)
+    return (x > y) - (x < y)
+
+
+def _truthy(v) -> bool:
+    if v is BLANK or v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        if v.upper() == "TRUE":
+            return True
+        if v.upper() == "FALSE" or v == "":
+            return False
+        raise EvalError("真偽にできない")
+    return _num(v) != 0
+
+
+class EvalCtx:
+    """式を評価するときのシート・現在セル・相対参照のずれ。"""
+
+    def __init__(self, wb, ws, row: int, col: int, anchor: tuple[int, int], today=None):
+        self.wb, self.ws = wb, ws
+        self.row, self.col = row, col
+        self.dr = row - anchor[0]
+        self.dc = col - anchor[1]
+        self.today = today or date.today()
+
+    def cell(self, sheet: str | None, col: int, row: int):
+        ws = self.ws
+        if sheet:
+            if self.wb is None or sheet not in self.wb.sheetnames:
+                raise EvalError(f"シートが無い: {sheet}")
+            ws = self.wb[sheet]
+        if row < 1 or col < 1 or row > 1048576 or col > 16384:
+            raise EvalError("参照範囲外")
+        v = ws.cell(row=row, column=col).value
+        return BLANK if v is None else v
+
+
+_REF_RE = re.compile(r"^(\$?)([A-Za-z]{1,3})(\$?)([1-9][0-9]*)$")
+
+
+class _Range:
+    __slots__ = ("values",)
+
+    def __init__(self, values):
+        self.values = values
+
+
+class _Parser:
+    def __init__(self, toks, ctx: EvalCtx):
+        self.t, self.i, self.ctx = toks, 0, ctx
+
+    def peek(self):
+        return self.t[self.i] if self.i < len(self.t) else (None, None)
+
+    def take(self):
+        tok = self.peek()
+        self.i += 1
+        return tok
+
+    def eat_op(self, *ops) -> str | None:
+        k, v = self.peek()
+        if k == "op" and v in ops:
+            self.i += 1
+            return v
+        return None
+
+    # 比較 < 連結 < 加減 < 乗除 < べき乗 < 単項 < 一次
+    def parse(self):
+        v = self.compare()
+        if self.i != len(self.t):
+            raise EvalError("式の末尾が余っている")
+        return v
+
+    def compare(self):
+        left = self.concat()
+        while True:
+            op = self.eat_op("=", "<>", "<", ">", "<=", ">=")
+            if not op:
+                return left
+            right = self.concat()
+            c = _compare(_scalar(left), _scalar(right))
+            left = {"=": c == 0, "<>": c != 0, "<": c < 0, ">": c > 0,
+                    "<=": c <= 0, ">=": c >= 0}[op]
+
+    def concat(self):
+        left = self.addsub()
+        while self.eat_op("&"):
+            left = _text(_scalar(left)) + _text(_scalar(self.addsub()))
+        return left
+
+    def addsub(self):
+        left = self.muldiv()
+        while True:
+            op = self.eat_op("+", "-")
+            if not op:
+                return left
+            r = self.muldiv()
+            left = _num(_scalar(left)) + _num(_scalar(r)) if op == "+" \
+                else _num(_scalar(left)) - _num(_scalar(r))
+
+    def muldiv(self):
+        left = self.power()
+        while True:
+            op = self.eat_op("*", "/")
+            if not op:
+                return left
+            r = _num(_scalar(self.power()))
+            if op == "/":
+                if r == 0:
+                    raise EvalError("#DIV/0!")
+                left = _num(_scalar(left)) / r
+            else:
+                left = _num(_scalar(left)) * r
+
+    def power(self):
+        left = self.unary()
+        if self.eat_op("^"):
+            return _num(_scalar(left)) ** _num(_scalar(self.power()))
+        return left
+
+    def unary(self):
+        op = self.eat_op("-", "+")
+        if op == "-":
+            return -_num(_scalar(self.unary()))
+        if op == "+":
+            return _num(_scalar(self.unary()))
+        return self.postfix()
+
+    def postfix(self):
+        v = self.primary()
+        while self.eat_op("%"):
+            v = _num(_scalar(v)) / 100.0
+        return v
+
+    def primary(self):
+        kind, val = self.take()
+        if kind == "num":
+            return float(val)
+        if kind == "str":
+            return val[1:-1].replace('""', '"')
+        if kind == "bool":
+            return val.upper() == "TRUE"
+        if kind == "err":
+            raise EvalError(val)
+        if kind == "op" and val == "(":
+            v = self.compare()
+            if not self.eat_op(")"):
+                raise EvalError("')' が無い")
+            return v
+        if kind == "func":
+            return self.call(val.upper())
+        if kind in ("sheet", "ref"):
+            return self.reference(kind, val)
+        if kind == "name":
+            raise EvalError(f"未対応の名前: {val}")
+        raise EvalError("式が読めない")
+
+    def reference(self, kind, val):
+        sheet = None
+        if kind == "sheet":
+            sheet = val[:-1]
+            if sheet.startswith("'"):
+                sheet = sheet[1:-1].replace("''", "'")
+            k2, v2 = self.take()
+            if k2 != "ref":
+                raise EvalError("シート参照の後がセルでない")
+            val = v2
+        a = self._addr(val)
+        if self.eat_op(":"):
+            k2, v2 = self.take()
+            if k2 != "ref":
+                raise EvalError("範囲の終わりがセルでない")
+            b = self._addr(v2)
+            r1, r2 = sorted((a[1], b[1]))
+            c1, c2 = sorted((a[0], b[0]))
+            if (r2 - r1 + 1) * (c2 - c1 + 1) > 200000:
+                raise EvalError("範囲が大きすぎる")
+            return _Range([self.ctx.cell(sheet, c, r)
+                           for r in range(r1, r2 + 1) for c in range(c1, c2 + 1)])
+        return self.ctx.cell(sheet, a[0], a[1])
+
+    def _addr(self, ref: str) -> tuple[int, int]:
+        m = _REF_RE.match(ref)
+        if not m:
+            raise EvalError(f"参照が読めない: {ref}")
+        col = column_index_from_string(m.group(2).upper())
+        row = int(m.group(4))
+        if not m.group(1):
+            col += self.ctx.dc
+        if not m.group(3):
+            row += self.ctx.dr
+        return col, row
+
+    def args(self) -> list:
+        out = []
+        if self.eat_op(")"):
+            return out
+        while True:
+            out.append(self.compare())
+            if self.eat_op(","):
+                continue
+            if self.eat_op(")"):
+                return out
+            raise EvalError("引数の区切りが読めない")
+
+    def call(self, name: str):
+        args = self.args()
+        fn = _FUNCS.get(name)
+        if fn is None:
+            raise EvalError(f"未対応の関数: {name}")
+        return fn(self.ctx, args)
+
+
+def _scalar(v):
+    if isinstance(v, _Range):
+        if len(v.values) != 1:
+            raise EvalError("単一セルが必要")
+        return v.values[0]
+    return v
+
+
+def _flat(args) -> list:
+    out = []
+    for a in args:
+        out.extend(a.values if isinstance(a, _Range) else [a])
+    return out
+
+
+def _nums(args) -> list[float]:
+    out = []
+    for v in _flat(args):
+        if v is BLANK or v is None or isinstance(v, str) or isinstance(v, bool):
+            continue
+        out.append(_num(v))
+    return out
+
+
+def _criteria(crit):
+    """COUNTIF などの条件文字列 → 判定関数。"""
+    if isinstance(crit, str):
+        m = re.match(r"^\s*(<>|>=|<=|=|<|>)\s*(.*)$", crit)
+        if m:
+            op, rest = m.group(1), m.group(2)
+            try:
+                target = float(rest)
+            except ValueError:
+                target = rest
+            return lambda v: {"=": lambda c: c == 0, "<>": lambda c: c != 0,
+                              "<": lambda c: c < 0, ">": lambda c: c > 0,
+                              "<=": lambda c: c <= 0, ">=": lambda c: c >= 0}[op](
+                _compare(v, target))
+    return lambda v: _compare(v, crit) == 0
+
+
+def _f_if(ctx, a):
+    if len(a) < 2:
+        raise EvalError("IF の引数不足")
+    return a[1] if _truthy(_scalar(a[0])) else (a[2] if len(a) > 2 else False)
+
+
+def _f_iferror(ctx, a):
+    try:
+        return _scalar(a[0])
+    except EvalError:
+        return a[1] if len(a) > 1 else ""
+
+
+def _f_weekday(ctx, a):
+    d = _num(_scalar(a[0]))
+    typ = int(_num(_scalar(a[1]))) if len(a) > 1 else 1
+    dow = int(d) % 7          # 1900/1/1(=1) は日曜
+    if typ == 1:
+        return float(dow if dow else 7)
+    if typ == 2:
+        return float(dow - 1 if dow >= 1 else 7)
+    if typ == 3:
+        return float((dow - 2) % 7)
+    return float(dow if dow else 7)
+
+
+def _dt(v):
+    n = _num(v)
+    return EXCEL_EPOCH + timedelta(days=n)
+
+
+_FUNCS = {
+    "AND": lambda c, a: all(_truthy(v) for v in _flat(a)),
+    "OR": lambda c, a: any(_truthy(v) for v in _flat(a)),
+    "NOT": lambda c, a: not _truthy(_scalar(a[0])),
+    "TRUE": lambda c, a: True,
+    "FALSE": lambda c, a: False,
+    "IF": _f_if,
+    "IFERROR": _f_iferror,
+    "IFNA": _f_iferror,
+    "ISBLANK": lambda c, a: _scalar(a[0]) is BLANK,
+    "ISNUMBER": lambda c, a: isinstance(_scalar(a[0]), (int, float, datetime, date, time))
+                             and not isinstance(_scalar(a[0]), bool),
+    "ISTEXT": lambda c, a: isinstance(_scalar(a[0]), str)
+                           and _scalar(a[0]) not in ERROR_TEXTS,
+    "ISERROR": lambda c, a: isinstance(_scalar(a[0]), str) and _scalar(a[0]) in ERROR_TEXTS,
+    "ISERR": lambda c, a: isinstance(_scalar(a[0]), str) and _scalar(a[0]) in ERROR_TEXTS,
+    "ISNA": lambda c, a: _scalar(a[0]) == "#N/A",
+    "ISEVEN": lambda c, a: int(_num(_scalar(a[0]))) % 2 == 0,
+    "ISODD": lambda c, a: int(_num(_scalar(a[0]))) % 2 == 1,
+    "N": lambda c, a: _num(_scalar(a[0])),
+    "T": lambda c, a: _scalar(a[0]) if isinstance(_scalar(a[0]), str) else "",
+    "LEN": lambda c, a: float(len(_text(_scalar(a[0])))),
+    "TRIM": lambda c, a: " ".join(_text(_scalar(a[0])).split()),
+    "UPPER": lambda c, a: _text(_scalar(a[0])).upper(),
+    "LOWER": lambda c, a: _text(_scalar(a[0])).lower(),
+    "LEFT": lambda c, a: _text(_scalar(a[0]))[:int(_num(_scalar(a[1]))) if len(a) > 1 else 1],
+    "RIGHT": lambda c, a: _text(_scalar(a[0]))[-(int(_num(_scalar(a[1]))) if len(a) > 1 else 1):]
+                          if (int(_num(_scalar(a[1]))) if len(a) > 1 else 1) else "",
+    "MID": lambda c, a: _text(_scalar(a[0]))[max(int(_num(_scalar(a[1]))) - 1, 0):
+                                             max(int(_num(_scalar(a[1]))) - 1, 0)
+                                             + int(_num(_scalar(a[2])))],
+    "EXACT": lambda c, a: _text(_scalar(a[0])) == _text(_scalar(a[1])),
+    "CONCATENATE": lambda c, a: "".join(_text(v) for v in _flat(a)),
+    "VALUE": lambda c, a: _num(_scalar(a[0])),
+    "ABS": lambda c, a: abs(_num(_scalar(a[0]))),
+    "INT": lambda c, a: float(math.floor(_num(_scalar(a[0])))),
+    "MOD": lambda c, a: _num(_scalar(a[0])) - _num(_scalar(a[1]))
+                        * math.floor(_num(_scalar(a[0])) / _num(_scalar(a[1]))),
+    "ROUND": lambda c, a: round(_num(_scalar(a[0])), int(_num(_scalar(a[1]))) if len(a) > 1 else 0),
+    "ROW": lambda c, a: float(c.row if not a else _row_of(a[0], c)),
+    "COLUMN": lambda c, a: float(c.col if not a else _col_of(a[0], c)),
+    "SUM": lambda c, a: float(sum(_nums(a))),
+    "COUNT": lambda c, a: float(len(_nums(a))),
+    "COUNTA": lambda c, a: float(sum(1 for v in _flat(a) if v is not BLANK and v != "")),
+    "COUNTBLANK": lambda c, a: float(sum(1 for v in _flat(a) if v is BLANK or v == "")),
+    "AVERAGE": lambda c, a: (float(sum(_nums(a))) / len(_nums(a))) if _nums(a)
+                            else _raise("#DIV/0!"),
+    "MAX": lambda c, a: max(_nums(a)) if _nums(a) else 0.0,
+    "MIN": lambda c, a: min(_nums(a)) if _nums(a) else 0.0,
+    "COUNTIF": lambda c, a: float(sum(1 for v in _flat([a[0]])
+                                      if _criteria(_scalar(a[1]))(v))),
+    "SUMIF": lambda c, a: float(sum(_num(v) for v in _flat([a[0]])
+                                    if _criteria(_scalar(a[1]))(v) and not isinstance(v, str))),
+    "TODAY": lambda c, a: float((datetime(c.today.year, c.today.month, c.today.day)
+                                 - EXCEL_EPOCH).days),
+    "NOW": lambda c, a: float((datetime(c.today.year, c.today.month, c.today.day)
+                               - EXCEL_EPOCH).days),
+    "YEAR": lambda c, a: float(_dt(_scalar(a[0])).year),
+    "MONTH": lambda c, a: float(_dt(_scalar(a[0])).month),
+    "DAY": lambda c, a: float(_dt(_scalar(a[0])).day),
+    "DATE": lambda c, a: float((datetime(int(_num(_scalar(a[0]))), int(_num(_scalar(a[1]))),
+                                         int(_num(_scalar(a[2])))) - EXCEL_EPOCH).days),
+    "WEEKDAY": _f_weekday,
+    "SEARCH": lambda c, a: float(_text(_scalar(a[1])).upper()
+                                 .index(_text(_scalar(a[0])).upper()) + 1)
+                           if _text(_scalar(a[0])).upper() in _text(_scalar(a[1])).upper()
+                           else _raise("#VALUE!"),
+    "FIND": lambda c, a: float(_text(_scalar(a[1])).index(_text(_scalar(a[0]))) + 1)
+                         if _text(_scalar(a[0])) in _text(_scalar(a[1])) else _raise("#VALUE!"),
+}
+
+
+def _raise(msg):
+    raise EvalError(msg)
+
+
+def _row_of(arg, ctx):
+    raise EvalError("ROW(参照) は未対応")
+
+
+def _col_of(arg, ctx):
+    raise EvalError("COLUMN(参照) は未対応")
+
+
+_TOKEN_CACHE: dict[str, list | str] = {}
+
+
+def eval_formula(expr: str, ctx: EvalCtx):
+    """式を評価する。評価できないときは EvalError。
+
+    同じ式が範囲内の全セルで評価されるので、字句解析の結果は使い回す。"""
+    s = expr.strip()
+    if s.startswith("="):
+        s = s[1:]
+    if not s:
+        raise EvalError("空の式")
+    toks = _TOKEN_CACHE.get(s)
+    if toks is None:
+        try:
+            toks = _tokenize(s)
+        except EvalError as e:
+            _TOKEN_CACHE[s] = str(e)
+            raise
+        if len(_TOKEN_CACHE) < 5000:
+            _TOKEN_CACHE[s] = toks
+    elif isinstance(toks, str):
+        raise EvalError(toks)
+    return _scalar(_Parser(toks, ctx).parse())
+
+
+# ---------------------------------------------------------------------------
+# 条件付き書式
+# ---------------------------------------------------------------------------
+
+def cf_key(cf: dict | None):
+    """条件付き書式の結果を CSS クラスのキーに使えるタプルにする。"""
+    if not cf:
+        return None
+    return tuple(sorted((k, v) for k, v in cf.items() if k not in ("icon", "novalue")))
+
+
+# アイコンセット: (色, 形) の並び。index 0 が「最も低い」
+_ICON_SETS = {
+    "3Arrows": [("#d62f2f", "down"), ("#e8b400", "right"), ("#4f9e37", "up")],
+    "3ArrowsGray": [("#888888", "down"), ("#888888", "right"), ("#888888", "up")],
+    "4Arrows": [("#d62f2f", "down"), ("#e08c00", "downright"), ("#c9b400", "upright"),
+                ("#4f9e37", "up")],
+    "4ArrowsGray": [("#888888", "down"), ("#888888", "downright"), ("#888888", "upright"),
+                    ("#888888", "up")],
+    "5Arrows": [("#d62f2f", "down"), ("#e08c00", "downright"), ("#e8b400", "right"),
+                ("#a3b800", "upright"), ("#4f9e37", "up")],
+    "5ArrowsGray": [("#888888", "down"), ("#888888", "downright"), ("#888888", "right"),
+                    ("#888888", "upright"), ("#888888", "up")],
+    "3TrafficLights1": [("#d62f2f", "circle"), ("#e8b400", "circle"), ("#4f9e37", "circle")],
+    "3TrafficLights2": [("#d62f2f", "circle"), ("#e8b400", "circle"), ("#4f9e37", "circle")],
+    "4TrafficLights": [("#3b3b3b", "circle"), ("#d62f2f", "circle"), ("#e8b400", "circle"),
+                       ("#4f9e37", "circle")],
+    "3Signs": [("#d62f2f", "diamond"), ("#e8b400", "triangle"), ("#4f9e37", "circle")],
+    "3Symbols": [("#d62f2f", "cross"), ("#e8b400", "excl"), ("#4f9e37", "check")],
+    "3Symbols2": [("#d62f2f", "cross"), ("#e8b400", "excl"), ("#4f9e37", "check")],
+    "3Flags": [("#d62f2f", "flag"), ("#e8b400", "flag"), ("#4f9e37", "flag")],
+    "4RedToBlack": [("#3b3b3b", "circle"), ("#6b3b3b", "circle"), ("#c46a5a", "circle"),
+                    ("#d62f2f", "circle")],
+    "3Stars": [("#c9a227", "star0"), ("#c9a227", "star1"), ("#c9a227", "star2")],
+    "5Quarters": [("#5b5b5b", "q0"), ("#5b5b5b", "q1"), ("#5b5b5b", "q2"),
+                  ("#5b5b5b", "q3"), ("#5b5b5b", "q4")],
+    "4Rating": [("#4c78a8", "r1"), ("#4c78a8", "r2"), ("#4c78a8", "r3"), ("#4c78a8", "r4")],
+    "5Rating": [("#4c78a8", "r1"), ("#4c78a8", "r2"), ("#4c78a8", "r3"), ("#4c78a8", "r4"),
+                ("#4c78a8", "r5")],
+    "5Boxes": [("#4c78a8", "b1"), ("#4c78a8", "b2"), ("#4c78a8", "b3"), ("#4c78a8", "b4"),
+               ("#4c78a8", "b5")],
+    "3TrafficLights": [("#d62f2f", "circle"), ("#e8b400", "circle"), ("#4f9e37", "circle")],
+}
+
+_ARROW_ANGLE = {"up": -90, "upright": -45, "right": 0, "downright": 45, "down": 90}
+
+
+def icon_svg(setname: str, idx: int) -> str:
+    """アイコンセットの1個を 1em 角のインライン SVG にする。"""
+    icons = _ICON_SETS.get(setname) or _ICON_SETS["3TrafficLights1"]
+    color, shape = icons[min(max(idx, 0), len(icons) - 1)]
+    b = ""
+    if shape in _ARROW_ANGLE:
+        ang = _ARROW_ANGLE[shape]
+        b = (f'<g transform="rotate({ang} 8 8)">'
+             f'<path d="M2,6 L9,6 L9,2.5 L14.5,8 L9,13.5 L9,10 L2,10 Z" fill="{color}"/></g>')
+    elif shape == "circle":
+        b = f'<circle cx="8" cy="8" r="6.2" fill="{color}"/>'
+    elif shape == "diamond":
+        b = f'<path d="M8,1.4 L14.6,8 L8,14.6 L1.4,8 Z" fill="{color}"/>'
+    elif shape == "triangle":
+        b = f'<path d="M8,1.6 L15,14 L1,14 Z" fill="{color}"/>'
+    elif shape == "check":
+        b = (f'<path d="M2.5,8.5 L6.3,12.4 L13.6,3.6" fill="none" stroke="{color}" '
+             f'stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>')
+    elif shape == "cross":
+        b = (f'<path d="M3,3 L13,13 M13,3 L3,13" fill="none" stroke="{color}" '
+             f'stroke-width="2.6" stroke-linecap="round"/>')
+    elif shape == "excl":
+        b = (f'<path d="M8,2 L8,10" stroke="{color}" stroke-width="2.6" stroke-linecap="round"/>'
+             f'<circle cx="8" cy="13.4" r="1.5" fill="{color}"/>')
+    elif shape == "flag":
+        b = (f'<path d="M3.2,1.5 L3.2,14.5" stroke="{color}" stroke-width="1.8"/>'
+             f'<path d="M4.4,2.2 L13.5,2.2 L11,5.6 L13.5,9 L4.4,9 Z" fill="{color}"/>')
+    elif shape.startswith("star"):
+        n = int(shape[4:])
+        pts = []
+        for i in range(10):
+            ang = -math.pi / 2 + i * math.pi / 5
+            r = 7.0 if i % 2 == 0 else 2.9
+            pts.append(f"{8 + math.cos(ang)*r:.1f},{8 + math.sin(ang)*r:.1f}")
+        star = "M" + " L".join(pts) + " Z"
+        fillpct = [0, 50, 100][min(n, 2)]
+        b = (f'<defs><linearGradient id="g{setname}{idx}"><stop offset="{fillpct}%" '
+             f'stop-color="{color}"/><stop offset="{fillpct}%" stop-color="#ffffff"/>'
+             f'</linearGradient></defs>'
+             f'<path d="{star}" fill="url(#g{setname}{idx})" stroke="{color}" '
+             f'stroke-width="1"/>')
+    elif shape.startswith("q"):
+        n = int(shape[1:])
+        b = f'<circle cx="8" cy="8" r="6.4" fill="none" stroke="{color}" stroke-width="1.4"/>'
+        if n:
+            ang = -math.pi / 2 + n * math.pi / 2
+            large = 1 if n > 2 else 0
+            ex, ey = 8 + math.cos(ang) * 6.4, 8 + math.sin(ang) * 6.4
+            if n == 4:
+                b += f'<circle cx="8" cy="8" r="6.4" fill="{color}"/>'
+            else:
+                b += (f'<path d="M8,8 L8,1.6 A6.4,6.4 0 {large} 1 {ex:.2f},{ey:.2f} Z" '
+                      f'fill="{color}"/>')
+    elif shape.startswith(("r", "b")):
+        n = int(shape[1:])
+        total = 4 if setname == "4Rating" else 5
+        b = ""
+        for i in range(total):
+            fill = color if i < n else "#ffffff"
+            hgt = 3 + (i + 1) * (10.0 / total)
+            b += (f'<rect x="{0.6 + i*(15.0/total):.2f}" y="{15-hgt:.2f}" '
+                  f'width="{13.0/total:.2f}" height="{hgt:.2f}" fill="{fill}" '
+                  f'stroke="{color}" stroke-width="0.7"/>')
+    return (f'<svg class="cfi" viewBox="0 0 16 16" width="1em" height="1em" '
+            f'aria-hidden="true">{b}</svg>')
+
+
+class CondFormat:
+    """シートの条件付き書式を評価して、セル → 追加書式 の対応表を作る。"""
+
+    MAX_CELLS = 400_000
+
+    def __init__(self, wb, ws, resolver: ColorResolver, bounds, today=None):
+        self.wb, self.ws, self.R = wb, ws, resolver
+        self.today = today or date.today()
+        self.map: dict[tuple[int, int], dict] = {}
+        self.n_rules = 0
+        self.truncated = False
+        self.unsupported: set[str] = set()
+        self.uneval: set[str] = set()      # 評価できなかった数式ルール（理由つき）
+        self._build(bounds)
+
+    # -- 準備 ---------------------------------------------------------------
+    def _build(self, bounds):
+        min_row, min_col, max_row, max_col = bounds
+        entries = []
+        for cf in self.ws.conditional_formatting:
+            rngs, anchor_r, anchor_c, full = [], None, None, []
+            for rr in cf.sqref.ranges:
+                r1, c1 = rr.min_row or 1, rr.min_col or 1
+                r2, c2 = rr.max_row or r1, rr.max_col or c1
+                anchor_r = r1 if anchor_r is None else min(anchor_r, r1)
+                anchor_c = c1 if anchor_c is None else min(anchor_c, c1)
+                full.append((r1, c1, min(r2, self.ws.max_row or r2),
+                             min(c2, self.ws.max_column or c2)))
+                a1, b1 = max(r1, min_row), max(c1, min_col)
+                a2, b2 = min(r2, max_row), min(c2, max_col)
+                if a1 <= a2 and b1 <= b2:
+                    rngs.append((a1, b1, a2, b2))
+            if not rngs:
+                continue
+            for rule in cf.rules:
+                entries.append({
+                    "rule": rule, "ranges": rngs, "full": full,
+                    "anchor": (anchor_r or 1, anchor_c or 1),
+                    "prio": rule.priority if rule.priority is not None else 10 ** 6,
+                    "stop": bool(rule.stopIfTrue),
+                    "agg": None,
+                })
+        if not entries:
+            return
+        entries.sort(key=lambda e: e["prio"])
+        self.n_rules = len(entries)
+
+        cell_rules: dict[tuple[int, int], list[int]] = {}
+        budget = self.MAX_CELLS
+        for idx, ent in enumerate(entries):
+            for (r1, c1, r2, c2) in ent["ranges"]:
+                n = (r2 - r1 + 1) * (c2 - c1 + 1)
+                if n > budget:
+                    self.truncated = True
+                    break
+                budget -= n
+                for r in range(r1, r2 + 1):
+                    for c in range(c1, c2 + 1):
+                        cell_rules.setdefault((r, c), []).append(idx)
+
+        for (r, c), idxs in cell_rules.items():
+            acc: dict = {}
+            for idx in idxs:
+                ent = entries[idx]
+                try:
+                    res = self._apply(ent, r, c)
+                except EvalError as e:
+                    # 値が数値でない等の「そのセルでは成り立たない」理由は無視し、
+                    # 式そのものが読めない場合だけ、あとで件数を知らせる
+                    if ent["rule"].type == "expression" and ent["rule"].formula:
+                        self.uneval.add(f"{str(ent['rule'].formula[0])[:40]} … {e}")
+                    res = None
+                except Exception:
+                    res = None
+                if res is None:
+                    continue
+                for k, v in res.items():
+                    acc.setdefault(k, v)
+                if ent["stop"]:
+                    break
+            if acc:
+                self.map[(r, c)] = acc
+
+    def get(self, r: int, c: int) -> dict | None:
+        return self.map.get((r, c))
+
+    # -- 集計（色スケール・データバー・上位/下位など） -----------------------
+    def _agg(self, ent) -> dict:
+        if ent["agg"] is not None:
+            return ent["agg"]
+        vals, texts = [], []
+        budget = 200_000          # 最小/最大や重複判定のための走査量の上限
+        for (r1, c1, r2, c2) in ent["full"]:
+            for r in range(r1, r2 + 1):
+                if budget <= 0:
+                    break
+                budget -= c2 - c1 + 1
+                for c in range(c1, c2 + 1):
+                    v = self.ws.cell(row=r, column=c).value
+                    if v is None:
+                        continue
+                    texts.append(v.upper() if isinstance(v, str) else v)
+                    if isinstance(v, bool) or isinstance(v, str):
+                        continue
+                    try:
+                        vals.append(_num(v))
+                    except EvalError:
+                        pass
+        vals.sort()
+        counts: dict = {}
+        for t in texts:
+            counts[t] = counts.get(t, 0) + 1
+        avg = sum(vals) / len(vals) if vals else 0.0
+        var = sum((v - avg) ** 2 for v in vals) / len(vals) if vals else 0.0
+        ent["agg"] = {"vals": vals, "min": vals[0] if vals else 0.0,
+                      "max": vals[-1] if vals else 0.0, "avg": avg,
+                      "sd": math.sqrt(var), "counts": counts}
+        return ent["agg"]
+
+    def _cfvo(self, cfvo, agg, ent, r, c, lo_hi=None):
+        """<cfvo> → 実数のしきい値。"""
+        t = getattr(cfvo, "type", None)
+        raw = getattr(cfvo, "val", None)
+        if t in ("min", "autoMin"):
+            return agg["min"]
+        if t in ("max", "autoMax"):
+            return agg["max"]
+        try:
+            x = float(raw)
+        except (TypeError, ValueError):
+            if t == "formula" and raw:
+                return _num(eval_formula(str(raw), EvalCtx(self.wb, self.ws, r, c,
+                                                           ent["anchor"], self.today)))
+            raise EvalError("cfvo が読めない")
+        if t == "num":
+            return x
+        if t == "percent":
+            lo, hi = (agg["min"], agg["max"]) if lo_hi is None else lo_hi
+            return lo + (hi - lo) * x / 100.0
+        if t == "percentile":
+            vs = agg["vals"]
+            if not vs:
+                return 0.0
+            pos = (len(vs) - 1) * x / 100.0
+            i = int(math.floor(pos))
+            j = min(i + 1, len(vs) - 1)
+            return vs[i] + (vs[j] - vs[i]) * (pos - i)
+        if t == "formula":
+            return _num(eval_formula(str(raw), EvalCtx(self.wb, self.ws, r, c,
+                                                       ent["anchor"], self.today)))
+        return x
+
+    # -- 差分書式 (dxf) -----------------------------------------------------
+    def _dxf(self, rule) -> dict:
+        out: dict = {}
+        dxf = getattr(rule, "dxf", None)
+        if dxf is None:
+            return out
+        f = getattr(dxf, "font", None)
+        if f is not None:
+            if f.b is not None:
+                out["b"] = bool(f.b)
+            if f.i is not None:
+                out["i"] = bool(f.i)
+            if f.strike is not None:
+                out["strike"] = bool(f.strike)
+            if f.u is not None:
+                out["u"] = f.u if isinstance(f.u, str) else "single"
+            col = self.R.resolve(f.color)
+            if col:
+                out["color"] = col
+        fl = getattr(dxf, "fill", None)
+        if fl is not None:
+            # dxf の塗りは patternType を省略して bgColor に色を入れるのが Excel の書き方
+            if getattr(fl, "patternType", None) == "solid":
+                col = self.R.resolve(fl.fgColor) or self.R.resolve(fl.bgColor)
+            else:
+                col = self.R.resolve(fl.bgColor) or self.R.resolve(fl.fgColor)
+            if col:
+                out["bg"] = col
+        bd = getattr(dxf, "border", None)
+        if bd is not None:
+            for side, key in (("top", "bt"), ("bottom", "bb"),
+                              ("left", "bl"), ("right", "br")):
+                css = border_css(getattr(bd, side, None), self.R)
+                if css:
+                    out[key] = css
+        nf = getattr(dxf, "numFmt", None)
+        if nf is not None and getattr(nf, "formatCode", None):
+            out["numfmt"] = nf.formatCode
+        return out
+
+    # -- 1ルールをセルに当てる ----------------------------------------------
+    def _apply(self, ent, r: int, c: int) -> dict | None:
+        rule = ent["rule"]
+        t = rule.type
+        v = self.ws.cell(row=r, column=c).value
+        blank = v is None or (isinstance(v, str) and v == "")
+
+        if t == "colorScale" and rule.colorScale is not None:
+            return self._color_scale(rule.colorScale, ent, r, c, v, blank)
+        if t == "dataBar" and rule.dataBar is not None:
+            return self._data_bar(rule.dataBar, ent, r, c, v, blank)
+        if t == "iconSet" and rule.iconSet is not None:
+            return self._icon_set(rule.iconSet, ent, r, c, v, blank)
+
+        matched = self._match(rule, t, ent, r, c, v, blank)
+        if not matched:
+            return None
+        return self._dxf(rule)
+
+    def _match(self, rule, t, ent, r, c, v, blank) -> bool:
+        if t == "expression":
+            if not rule.formula:
+                return False
+            ctx = EvalCtx(self.wb, self.ws, r, c, ent["anchor"], self.today)
+            return _truthy(eval_formula(str(rule.formula[0]), ctx))
+
+        if t == "cellIs":
+            if blank:
+                return False
+            ctx = EvalCtx(self.wb, self.ws, r, c, ent["anchor"], self.today)
+            ops = [eval_formula(str(f), ctx) for f in (rule.formula or [])]
+            if not ops:
+                return False
+            op = rule.operator
+            a = ops[0]
+            if op == "between":
+                if len(ops) < 2:
+                    return False
+                lo, hi = (ops[0], ops[1])
+                if _compare(lo, hi) > 0:
+                    lo, hi = hi, lo
+                return _compare(v, lo) >= 0 and _compare(v, hi) <= 0
+            if op == "notBetween":
+                if len(ops) < 2:
+                    return False
+                lo, hi = (ops[0], ops[1])
+                if _compare(lo, hi) > 0:
+                    lo, hi = hi, lo
+                return not (_compare(v, lo) >= 0 and _compare(v, hi) <= 0)
+            cmpv = _compare(v, a)
+            return {"equal": cmpv == 0, "notEqual": cmpv != 0,
+                    "greaterThan": cmpv > 0, "lessThan": cmpv < 0,
+                    "greaterThanOrEqual": cmpv >= 0,
+                    "lessThanOrEqual": cmpv <= 0}.get(op, False)
+
+        if t in ("containsText", "notContainsText", "beginsWith", "endsWith"):
+            s = _text(v).upper()
+            needle = (rule.text or "").upper()
+            if not needle:
+                return False
+            hit = {"containsText": needle in s,
+                   "notContainsText": needle not in s,
+                   "beginsWith": s.startswith(needle),
+                   "endsWith": s.endswith(needle)}[t]
+            return hit
+        if t == "containsBlanks":
+            return blank or (isinstance(v, str) and v.strip() == "")
+        if t == "notContainsBlanks":
+            return not (blank or (isinstance(v, str) and v.strip() == ""))
+        if t == "containsErrors":
+            return isinstance(v, str) and v in ERROR_TEXTS
+        if t == "notContainsErrors":
+            return not (isinstance(v, str) and v in ERROR_TEXTS)
+
+        if t in ("duplicateValues", "uniqueValues"):
+            if blank:
+                return False
+            agg = self._agg(ent)
+            key = v.upper() if isinstance(v, str) else v
+            n = agg["counts"].get(key, 0)
+            return n > 1 if t == "duplicateValues" else n == 1
+
+        if t == "top10":
+            if blank or isinstance(v, str) or isinstance(v, bool):
+                return False
+            agg = self._agg(ent)
+            vs = agg["vals"]
+            if not vs:
+                return False
+            rank = int(rule.rank or 10)
+            bottom = bool(rule.bottom)
+            if rule.percent:
+                k = max(int(len(vs) * rank / 100.0), 1)
+            else:
+                k = max(min(rank, len(vs)), 1)
+            thr = vs[k - 1] if bottom else vs[len(vs) - k]
+            x = _num(v)
+            return x <= thr if bottom else x >= thr
+
+        if t == "aboveAverage":
+            if blank or isinstance(v, str) or isinstance(v, bool):
+                return False
+            agg = self._agg(ent)
+            x, avg = _num(v), agg["avg"]
+            sd = rule.stdDev
+            above = rule.aboveAverage is None or bool(rule.aboveAverage)
+            if sd:
+                thr = avg + agg["sd"] * int(sd) * (1 if above else -1)
+                return x > thr if above else x < thr
+            if rule.equalAverage:
+                return x >= avg if above else x <= avg
+            return x > avg if above else x < avg
+
+        if t == "timePeriod":
+            if blank:
+                return False
+            try:
+                d = _dt(v).date()
+            except EvalError:
+                return False
+            td = self.today
+            wd = td.weekday()                    # 月=0
+            week0 = td - timedelta(days=(wd + 1) % 7)     # 今週の日曜
+            p = rule.timePeriod
+            if p == "today":
+                return d == td
+            if p == "yesterday":
+                return d == td - timedelta(days=1)
+            if p == "tomorrow":
+                return d == td + timedelta(days=1)
+            if p == "last7Days":
+                return td - timedelta(days=6) <= d <= td
+            if p == "thisWeek":
+                return week0 <= d < week0 + timedelta(days=7)
+            if p == "lastWeek":
+                return week0 - timedelta(days=7) <= d < week0
+            if p == "nextWeek":
+                return week0 + timedelta(days=7) <= d < week0 + timedelta(days=14)
+            if p == "thisMonth":
+                return (d.year, d.month) == (td.year, td.month)
+            if p == "lastMonth":
+                m = td.month - 1 or 12
+                y = td.year - (1 if td.month == 1 else 0)
+                return (d.year, d.month) == (y, m)
+            if p == "nextMonth":
+                m = td.month + 1 if td.month < 12 else 1
+                y = td.year + (1 if td.month == 12 else 0)
+                return (d.year, d.month) == (y, m)
+            return False
+
+        self.unsupported.add(t or "?")
+        return False
+
+    # -- 色スケール / データバー / アイコンセット ---------------------------
+    def _color_scale(self, cs, ent, r, c, v, blank):
+        if blank or isinstance(v, str) or isinstance(v, bool):
+            return None
+        agg = self._agg(ent)
+        x = _num(v)
+        stops = []
+        for i, cfvo in enumerate(cs.cfvo):
+            thr = self._cfvo(cfvo, agg, ent, r, c)
+            col = self.R.resolve(cs.color[i]) if i < len(cs.color) else None
+            stops.append((thr, col or "#ffffff"))
+        stops.sort(key=lambda s: s[0])
+        if not stops:
+            return None
+        if x <= stops[0][0]:
+            return {"bg": stops[0][1]}
+        if x >= stops[-1][0]:
+            return {"bg": stops[-1][1]}
+        for i in range(len(stops) - 1):
+            lo, hi = stops[i], stops[i + 1]
+            if lo[0] <= x <= hi[0]:
+                span = hi[0] - lo[0]
+                t = 0.0 if span == 0 else (x - lo[0]) / span
+                return {"bg": mix(hi[1], lo[1], t)}
+        return None
+
+    def _data_bar(self, db, ent, r, c, v, blank):
+        if blank or isinstance(v, str) or isinstance(v, bool):
+            return None
+        agg = self._agg(ent)
+        x = _num(v)
+        cfvo = list(db.cfvo)
+        lo = self._cfvo(cfvo[0], agg, ent, r, c) if cfvo else agg["min"]
+        hi = self._cfvo(cfvo[-1], agg, ent, r, c) if len(cfvo) > 1 else agg["max"]
+        lo, hi = min(lo, hi), max(lo, hi)
+        lo = min(lo, 0.0) if agg["min"] < 0 else lo
+        span = hi - lo
+        pct = 0.0 if span == 0 else (x - lo) / span * 100.0
+        # 省略時のスキーマ既定は 10/90 だが、いまの Excel は拡張(x14)側の設定で描くので
+        # バーはセル幅いっぱいまで伸びる。明示されているときだけその値に従う。
+        minlen = float(db.minLength if db.minLength is not None else 0)
+        maxlen = float(db.maxLength if db.maxLength is not None else 100)
+        pct = minlen + (maxlen - minlen) * max(min(pct, 100.0), 0.0) / 100.0
+        col = self.R.resolve(db.color) or "#638ec6"
+        out = {"bar": (mix(col, "#ffffff", 0.55), round(pct, 1),
+                       bool(getattr(db, "direction", None) == "rightToLeft"))}
+        if getattr(db, "showValue", True) is False:
+            out["novalue"] = True
+        return out
+
+    def _icon_set(self, ics, ent, r, c, v, blank):
+        if blank or isinstance(v, str) or isinstance(v, bool):
+            return None
+        agg = self._agg(ent)
+        x = _num(v)
+        cfvo = list(ics.cfvo)
+        n = len(cfvo)
+        idx = 0
+        for i in range(1, n):
+            try:
+                thr = self._cfvo(cfvo[i], agg, ent, r, c)
+            except EvalError:
+                continue
+            gte = getattr(cfvo[i], "gte", True)
+            if (x >= thr) if (gte is None or gte) else (x > thr):
+                idx = i
+        setname = ics.iconSet or "3TrafficLights1"
+        if getattr(ics, "reverse", False):
+            idx = n - 1 - idx
+        out = {"icon": (setname, idx)}
+        if getattr(ics, "showValue", True) is False:
+            out["novalue"] = True
+        return out
+
+
 _TAG_RE = re.compile(r"<[^>]*>")
 
 
@@ -1605,7 +2670,8 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                  bounds: tuple[int, int, int, int] | None = None,
                  page_breaks: set[int] | None = None,
                  title_rows: tuple[int, int] | None = None,
-                 overrides: dict[tuple[int, int], str] | None = None) -> dict:
+                 overrides: dict[tuple[int, int], str] | None = None,
+                 cond: "CondFormat | None" = None) -> dict:
     full_row = min(ws.max_row or 1, opts.max_rows)
     full_col = min(ws.max_column or 1, opts.max_cols)
     grid = Grid(ws, full_col, full_row)
@@ -1613,6 +2679,7 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
     max_row, max_col = min(max_row, full_row), min(max_col, full_col)
     styles = StyleSheet(resolver, gridlines)
     page_breaks = page_breaks or set()
+    cfmap = cond.map if cond is not None else {}
 
     # 結合セル（印刷範囲で切った場合は、はみ出した分を詰めて表示する）
     covered: dict[tuple[int, int], tuple[int, int]] = {}
@@ -1673,7 +2740,9 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                 continue
             hval = rich_text_html(cell.value)
             if hval is None:
-                text = format_cell_value(cell.value, cell.number_format)
+                cfx = cfmap.get((sr, sc))
+                nfmt = (cfx or {}).get("numfmt") or cell.number_format
+                text = format_cell_value(cell.value, nfmt)
                 hval = esc(text) if text != "" else ""
                 raw = text
             else:
@@ -1756,16 +2825,21 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
             sr, sc = src.get((r, c), (r, c))
             cell = ws.cell(row=sr, column=sc)
             rs, cs = spans.get((r, c), (1, 1))
-            cls = styles.class_for(cell, *grid_edges(r, c, rs, cs))
+            cfx = cfmap.get((sr, sc))
+            cls = styles.class_for(cell, *grid_edges(r, c, rs, cs), cfx)
             attr = f' class="{cls}"'
             if rs > 1:
                 attr += f' rowspan="{rs}"'
             if cs > 1:
                 attr += f' colspan="{cs}"'
             body = content.get((r, c))
-            if not body:
+            icon = ""
+            if cfx and cfx.get("icon"):
+                icon = icon_svg(*cfx["icon"])
+            if not body and not icon:
                 out.append(f"<td{attr}></td>")
                 continue
+            body = body or ""
 
             # 見切れの再現。Excel と同じく、横は「隣に文字があるところ」まで、
             # 縦は行の高さまでで切る。切った文字も DOM には残すのでコピー・検索できる。
@@ -1804,13 +2878,16 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                                    bool(cell.font and cell.font.b)) > own - 2 * CELL_PAD:
                         kls += {"right": " ovl", "center": " ovc",
                                 "centerContinuous": " ovc"}.get(halign, " ov")
+            if cfx and cfx.get("novalue"):
+                kls += " nv"
             if kls:
                 kls = f' class="{kls.strip()}"'
 
-            inner = body
             link = cell.hyperlink
             if link is not None and getattr(link, "target", None):
-                inner = f'<a href="{esc(link.target)}">{body}</a>'
+                inner = icon + f'<a href="{esc(link.target)}">{body}</a>'
+            else:
+                inner = icon + body
             tips = []
             if cell.comment is not None and cell.comment.text:
                 tips.append(cell.comment.text)
@@ -2102,6 +3179,8 @@ td>i.cr{display:flex;justify-content:flex-end}
 /* Excel と同じく、塗りやはみ出した文字が通った目盛線は消える。
    --glr/--glb は目盛線の色だけを差し替える穴なので、本物の罫線には影響しない */
 td.ngr{--glr:transparent}
+svg.cfi{vertical-align:-0.14em;margin-right:2px;flex:none}
+td>i.nv{color:transparent}          /* データバー/アイコンで「値を表示しない」設定 */
 /* 見切れているセル: クリックで全文表示を固定、もう一度クリックで元に戻す。
    切れている文字も DOM 上には残っているので、開かなくても選択コピー・検索はできる。 */
 td>i.on{cursor:zoom-in}
@@ -2290,6 +3369,9 @@ def convert(src: str, dst: str, opts) -> str:
         except Exception as e:      # 解決できなくても保存値をそのまま出せばよい
             print(f"警告: シート名の式を解決できませんでした ({e})", file=sys.stderr)
     n_fixed = sum(len(m) for m in fixed.values())
+    n_cf = n_cf_cells = 0
+    unsupported_cf: set[str] = set()
+    uneval_cf: set[str] = set()
 
     sheets = []
     for name in targets:
@@ -2318,9 +3400,26 @@ def convert(src: str, dst: str, opts) -> str:
                 print(f"警告: '{name}' の図形を読み込めませんでした ({e})", file=sys.stderr)
         bounds = print_area_bounds(ws, opts) if opts.print_area else None
         breaks = {b.id + 1 for b in ws.row_breaks.brk} if ws.row_breaks else set()
+        cond = None
+        if not opts.no_cond_format:
+            cb = bounds or (1, 1, max_row, max_col)
+            try:
+                cond = CondFormat(wb, ws, resolver, cb)
+            except Exception as e:      # 条件付き書式で全体を落とさない
+                print(f"警告: '{name}' の条件付き書式を評価できませんでした ({e})",
+                      file=sys.stderr)
+                cond = None
         res = render_sheet(ws, resolver, shapes, gl, name, opts, formulas.get(name),
-                           bounds, breaks, title_row_range(ws), fixed.get(name))
+                           bounds, breaks, title_row_range(ws), fixed.get(name), cond)
         missing_total += res["missing"]
+        if cond is not None and cond.n_rules:
+            n_cf += cond.n_rules
+            n_cf_cells += len(cond.map)
+            if cond.truncated:
+                print(f"警告: '{name}' は条件付き書式の対象セルが多すぎるため一部を省略しました",
+                      file=sys.stderr)
+            unsupported_cf.update(cond.unsupported)
+            uneval_cf.update(cond.uneval)
         page = page_settings(ws, res["width"]) if not opts.no_page_setup else None
         po = getattr(ws, "print_options", None)
         sheets.append({"name": name, "html": res["html"], "css": res["css"], "page": page,
@@ -2339,6 +3438,15 @@ def convert(src: str, dst: str, opts) -> str:
               + (f"（うち {missing_total} 個は結果が未保存）" if missing_total else ""))
     if n_fixed:
         print(f"  シート名を出す数式 {n_fixed} 個 → 保存されていたエラーを解決して表示")
+    if n_cf:
+        print(f"  条件付き書式 {n_cf} ルール → {n_cf_cells} セルに反映")
+    if unsupported_cf:
+        print(f"  ※ 未対応の条件付き書式: {', '.join(sorted(unsupported_cf))}", file=sys.stderr)
+    if uneval_cf:
+        print(f"  ※ 判定できなかった数式ルール {len(uneval_cf)} 件（そのルールは不成立として扱いました）:",
+              file=sys.stderr)
+        for u in sorted(uneval_cf)[:5]:
+            print(f"      {u}", file=sys.stderr)
     if missing_total and not opts.show_formula:
         print("  ※ 計算結果が保存されていない数式セルは空欄になります。"
               "Excel で開いて上書き保存するか、--show-formula で数式そのものを出せます。",
@@ -2360,6 +3468,8 @@ def main(argv=None):
     ap.add_argument("--gridlines", choices=["auto", "on", "off"], default="auto",
                     help="目盛線の描画（既定 auto = Excel の設定に従う）")
     ap.add_argument("--no-drawings", action="store_true", help="画像・図形を出力しない")
+    ap.add_argument("--no-cond-format", action="store_true",
+                    help="条件付き書式（色付け・データバー・アイコン）を反映しない")
     ap.add_argument("--hidden-sheets", action="store_true", help="非表示シートも出力する")
     ap.add_argument("--max-cols", type=int, default=1024, help="出力する最大列数")
     ap.add_argument("--max-rows", type=int, default=20000, help="出力する最大行数")
