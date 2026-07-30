@@ -1579,6 +1579,233 @@ def tidy_formula(f: str) -> str:
     return re.sub(r"_xlfn\.(_xlws\.)?", "", f)
 
 
+# ---------------------------------------------------------------------------
+# 数式の吹き出し表示（--formula-balloons）
+# ---------------------------------------------------------------------------
+# 長い数式は括弧と引数区切りの位置で折り、括弧の対応・文字列・数値・参照を
+# 色分けして出す。式の中身は変えず、改行とインデントを足すだけ。
+
+FB_WRAP = 50          # 1行に収める目安の文字数（吹き出しの max-width と揃える）
+FB_CH_PX = 6.05       # 等幅 10px の 1 文字幅(px)。右端で右寄せに切り替える判定に使う
+FB_LINES = 6          # 畳まずに見せる行数。超えた分はホバー／クリックで開く
+
+def _fb_len(s: str) -> int:
+    """半角1・全角2で数えた表示幅。折る位置の判断と吹き出しの幅見積もりに使う。"""
+    w = 0
+    for ch in s:
+        o = ord(ch)
+        w += 1 if (o < 0x2E80 or 0xFF61 <= o <= 0xFF9F) else 2
+    return w
+
+
+_FB_IDENT = re.compile(r"\$?[^\W\d][\w.$]*")
+_FB_NUM = re.compile(r"\d+(?:\.\d*)?(?:[Ee][-+]?\d+)?|\.\d+")
+_FB_ERR = re.compile(r"#[A-Za-z0-9_/]*[!?]?")
+_FB_A1 = re.compile(r"[A-Za-z]{1,3}\d{1,7}")
+# 種別 → CSS クラス。name(名前定義) と op、区切りは色を付けない
+_FB_CLS = {"str": "t", "sh": "h", "num": "n", "ref": "r", "fn": "f", "err": "e"}
+
+
+def _fml_tokens(f: str) -> list[tuple[str, str, int]]:
+    """数式を (種別, 文字, 括弧の深さ) に分ける。文字列リテラルの中は触らない。"""
+    toks: list[tuple[str, str, int]] = []
+    i, n, depth = 0, len(f), 0
+    while i < n:
+        ch = f[i]
+        if ch in "\"'":                     # "文字列" / 'シート名'
+            j, q = i + 1, ch
+            while j < n:
+                if f[j] != q:
+                    j += 1
+                elif j + 1 < n and f[j + 1] == q:    # "" は文字としての引用符
+                    j += 2
+                else:
+                    j += 1
+                    break
+            toks.append(("str" if ch == '"' else "sh", f[i:j], depth))
+            i = j
+            continue
+        if ch in "{[":                      # 配列定数・構造参照はまとめて1つ扱い
+            j = f.find("}" if ch == "{" else "]", i)
+            j = n if j < 0 else j + 1
+            toks.append(("num" if ch == "{" else "ref", f[i:j], depth))
+            i = j
+            continue
+        if ch in " \t":
+            j = i
+            while j < n and f[j] in " \t":
+                j += 1
+            toks.append(("sp", f[i:j].replace("\t", "  "), depth))
+            i = j
+            continue
+        if ch == "#":                       # #REF! などのエラー値
+            m = _FB_ERR.match(f, i)
+            toks.append(("err", m.group(0), depth))
+            i = m.end()
+            continue
+        if ch == "(":
+            toks.append(("(", ch, depth))
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+            toks.append((")", ch, depth))
+        elif ch in ",;":
+            toks.append((",", ch, depth))
+        elif ch in "\r\n":
+            if ch == "\n" or i + 1 >= n or f[i + 1] != "\n":
+                toks.append(("nl", "\n", depth))
+        else:
+            m = _FB_IDENT.match(f, i) or _FB_NUM.match(f, i)
+            if m is None:
+                toks.append(("op", ch, depth))
+            else:
+                t, i = m.group(0), m.end()
+                if t[0].isdigit() or t[0] == ".":
+                    kind = "num"
+                elif i < n and f[i] == "(":
+                    kind = "fn"
+                elif i < n and f[i] == "!":
+                    kind = "sh"
+                elif _FB_A1.fullmatch(t.replace("$", "")):
+                    kind = "ref"
+                else:
+                    kind = "name"
+                toks.append((kind, t, depth))
+                continue
+        i += 1
+    return toks
+
+
+def format_formula(f: str, width: int = FB_WRAP) -> tuple[str, int, int]:
+    """数式を吹き出し向けに整形して HTML を返す。返り値は (HTML, 最長行の文字数, 行数)。
+
+    元から改行が入っている式は書いた人の意図とみなしてその改行を尊重し、
+    改行が無くて1行に収まらない式だけを括弧と引数区切りの位置で折る。
+    """
+    toks = _fml_tokens(tidy_formula(f))
+    ind = [-1] * len(toks)          # そのトークンの前で改行するならインデント段数
+    if not any(t[0] == "nl" for t in toks):
+        pair: dict[int, int] = {}
+        stack: list[int] = []
+        for i, t in enumerate(toks):
+            if t[0] == "(":
+                stack.append(i)
+            elif t[0] == ")" and stack:
+                pair[stack.pop()] = i
+        cum = [0]
+        for t in toks:
+            cum.append(cum[-1] + _fb_len(t[1]))
+
+        def rows_of(lo: int, hi: int, level: int, pts: list[int]) -> list[tuple[int, int]]:
+            """候補位置 pts で 1 行に入るところまで詰めて折り、行の範囲を返す。"""
+            room = width - level * 2
+            starts = [lo]
+            k = 0
+            while k < len(pts) and cum[hi] - cum[starts[-1]] > room:
+                nxt = k
+                while nxt < len(pts) and cum[pts[nxt]] - cum[starts[-1]] <= room:
+                    nxt += 1
+                k = max(nxt - 1, k)
+                ind[pts[k]] = level
+                starts.append(pts[k])
+                k += 1
+            starts.append(hi)
+            return list(zip(starts, starts[1:]))
+
+        def fold(lo: int, hi: int, level: int) -> None:
+            """toks[lo:hi] を level 段のインデントで並べる。収まらなければ折る。
+
+            折り先は引数区切り → 演算子 → 括弧を開く、の順に選ぶ。区切りより
+            演算子を先に使うと ">="&$D$2 のような塊が分断されて読みにくい。
+            """
+            room = width - level * 2
+            if cum[hi] - cum[lo] <= room:
+                return
+            # 直下（括弧の中には入らない）の折れる位置と括弧グループを集める
+            seps: list[int] = []
+            ops: list[int] = []
+            groups: list[tuple[int, int]] = []
+            i = lo
+            while i < hi:
+                kind, text, _ = toks[i]
+                j = pair.get(i, -1) if kind == "(" else -1
+                if i < j < hi:
+                    groups.append((i, j))
+                    i = j + 1
+                    continue
+                if kind == ",":                 # 引数区切りの直後で折る
+                    i += 1
+                    while i < hi and toks[i][0] == "sp":
+                        i += 1
+                    if i < hi:
+                        seps.append(i)
+                    continue
+                # 演算子はその手前で折る。単項マイナスや <= の途中では折らない
+                if (kind == "op" and text in "&+-*/^<>=" and i > lo
+                        and toks[i - 1][0] not in ("op", "(", ",")):
+                    ops.append(i)
+                i += 1
+            for a, b in rows_of(lo, hi, level, seps):
+                if cum[b] - cum[a] <= room:
+                    continue
+                for a2, b2 in rows_of(a, b, level, [p for p in ops if a < p < b]):
+                    rest = cum[b2] - cum[a2]
+                    if rest <= room:
+                        continue
+                    # 最後の手段として、中身の長い括弧から順に次の行へ送り出す
+                    inner = sorted((g for g in groups if a2 <= g[0] < b2 and g[0] + 1 < g[1]),
+                                   key=lambda g: cum[g[1]] - cum[g[0] + 1], reverse=True)
+                    for o, c in inner:
+                        if rest <= room:
+                            break
+                        ind[o + 1] = level + 1       # ( の直後で改行
+                        ind[c] = level               # ) の直前で改行
+                        fold(o + 1, c, level + 1)
+                        rest -= cum[c] - cum[o + 1]
+
+        fold(0, len(toks), 0)
+
+    out: list[str] = []
+    line = cols = 0
+    rows = 1
+    for i, (kind, text, depth) in enumerate(toks):
+        if ind[i] >= 0:
+            out.append("\n" + "  " * ind[i])
+            cols, rows, line = max(cols, line), rows + 1, ind[i] * 2
+            if kind == "sp":                 # 折った位置の空白は捨てる
+                continue
+        if kind == "nl":
+            cols, rows, line = max(cols, line), rows + 1, 0
+            out.append("\n")
+            continue
+        line += _fb_len(text)
+        cls = f"p{depth % 3}" if kind in ("(", ")") else _FB_CLS.get(kind)
+        out.append(f'<b class="{cls}">{esc(text)}</b>' if cls else esc(text))
+    return "".join(out), max(cols, line), rows
+
+
+_FB_REF = re.compile(r"(\$?)([A-Za-z]{1,3})(\$?)(\d{1,7})")
+
+
+def formula_shape(f: str, row: int, col: int) -> str:
+    """数式を「そのセルから見た相対位置」に直した形にする。
+
+    相対参照でコピーされた式どうしは同じ文字列になるので、
+    「同じ式が縦や横に並んでいる」範囲の判定に使える（R1C1 形式と同じ考え方）。
+    """
+    out = []
+    for kind, text, _ in _fml_tokens(tidy_formula(f)):
+        m = _FB_REF.fullmatch(text) if kind == "ref" else None
+        if m is None:
+            out.append(text)
+            continue
+        ca, cl, ra, rn = m.groups()
+        r, c = int(rn), column_index_from_string(cl.upper())
+        out.append((f"R{r}" if ra else f"R[{r - row}]")
+                   + (f"C{c}" if ca else f"C[{c - col}]"))
+    return "".join(out)
+
+
 ERROR_TEXTS = {"#VALUE!", "#REF!", "#N/A", "#DIV/0!", "#NAME?", "#NULL!", "#NUM!",
                "#SPILL!", "#CALC!", "#FIELD!", "#BLOCKED!", "#CONNECT!", "#GETTING_DATA"}
 
@@ -2819,7 +3046,7 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                 continue
             if cell.value is None:
                 # 数式なのに計算結果が保存されていないセル
-                fml = formulas.get((r, c))
+                fml = formulas.get((sr, sc))
                 if not fml:
                     continue
                 missing_cache += 1
@@ -2893,6 +3120,70 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
         out.append(f'<col style="width:{grid.col_px[c]}px">')
     out.append("</colgroup>")
 
+    # 同じ式が縦や横にコピーされている範囲は、先頭のセルにだけ吹き出しを出す。
+    # 方眼紙の表では同じ式が何十行も続くので、全部出すと吹き出しで埋まってしまう。
+    # 隠すのは CSS 側なので、画面下部のトグルで残りも出せる。
+    fb_dup: set[tuple[int, int]] = set()
+    fb_rep: dict[tuple[int, int], int] = {}
+    if opts.formula_balloons and formulas:
+        shape: dict[tuple[int, int], str] = {}
+        for r in range(min_row, max_row + 1):
+            for c in range(min_col, max_col + 1):
+                if (r, c) in covered:
+                    continue
+                sr, sc = src.get((r, c), (r, c))
+                fml = formulas.get((sr, sc))
+                if fml:
+                    shape[(r, c)] = formula_shape(fml, sr, sc)
+        head_of: dict[tuple[int, int], tuple[int, int]] = {}
+        up: dict[int, tuple[int, int]] = {}      # 列 → その列で直前に見た数式セル
+        for r in range(min_row, max_row + 1):
+            left: tuple[int, int] | None = None
+            for c in range(min_col, max_col + 1):
+                s = shape.get((r, c))
+                if s is None:
+                    continue
+                head = None
+                for prev in (up.get(c), left):   # 上と左のどちらかの続きなら繰り返し
+                    if prev is not None and shape.get(prev) == s:
+                        head = head_of[prev]
+                        break
+                if head is None:
+                    head_of[(r, c)] = (r, c)
+                    fb_rep[(r, c)] = 1
+                else:
+                    head_of[(r, c)] = head
+                    fb_dup.add((r, c))
+                    fb_rep[head] += 1
+                up[c] = left = (r, c)
+
+    n_balloon = n_hidden = 0
+
+    def balloon(r: int, c: int, sr: int, sc: int) -> str:
+        """数式の吹き出し（--formula-balloons）。数式セルの下に常時出す。"""
+        nonlocal n_balloon, n_hidden
+        fml = formulas.get((sr, sc))
+        if not fml:
+            return ""
+        n_balloon += 1
+        body, cols, rows = format_formula(fml)
+        rep = fb_rep.get((r, c), 1)
+        if rep > 1:              # 同じ式が続く範囲の先頭。何セル分かを添える
+            body += f'<b class="c"> ×{rep}</b>'
+        kls = "fb"
+        w = min(cols, FB_WRAP) * FB_CH_PX + 14
+        x = grid.x_at(c - 1) - x0
+        if x + w > cw and x > w:        # 台紙の右端をはみ出すので右寄せにする
+            kls += " fbr"
+        if rows > FB_LINES:
+            kls += " fbc"              # 畳んでおき、ホバー／クリックで全文を出す
+        if (r, c) in fb_dup:
+            kls += " fbd"              # 同じ式の繰り返し。既定では隠す
+            n_hidden += 1
+        # 重なったときに上・左のセルの吹き出しが手前に来るようにする
+        z = 20 + (max_row - r) * 2048 + (max_col - c)
+        return f'<div class="{kls}" style="--fbz:{z}">{body}</div>'
+
     thead_end = 0
     if title_rows and title_rows[0] <= min_row:
         thead_end = min(title_rows[1], max_row)
@@ -2916,7 +3207,8 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
             rs, cs = spans.get((r, c), (1, 1))
             cfx = cfmap.get((sr, sc))
             cls = styles.class_for(cell, *grid_edges(r, c, rs, cs), cfx)
-            attr = f' class="{cls}"'
+            fb = balloon(r, c, sr, sc) if opts.formula_balloons else ""
+            attr = f' class="{cls} fx"' if fb else f' class="{cls}"'
             if rs > 1:
                 attr += f' rowspan="{rs}"'
             if cs > 1:
@@ -2926,7 +3218,7 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
             if cfx and cfx.get("icon"):
                 icon = icon_svg(*cfx["icon"])
             if not body and not icon:
-                out.append(f"<td{attr}></td>")
+                out.append(f"<td{attr}>{fb}</td>")
                 continue
             body = body or ""
 
@@ -2985,7 +3277,7 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
                 if fml:
                     tips.append(tidy_formula(fml))
             tip = f' title="{esc(chr(10).join(tips))}"' if tips else ""
-            out.append(f"<td{attr}{tip}><i{kls}{limit}>{inner}</i></td>")
+            out.append(f"<td{attr}{tip}>{fb}<i{kls}{limit}>{inner}</i></td>")
         out.append("</tr>")
     out.append("</tbody></table>")
 
@@ -2997,7 +3289,7 @@ def render_sheet(ws, resolver: ColorResolver, drawings: list[dict],
     out.append("</div>")
     return {"html": "".join(out), "css": styles.css(), "missing": missing_cache,
             "width": cw, "height": ch, "rows": max_row - min_row + 1,
-            "cols": max_col - min_col + 1}
+            "cols": max_col - min_col + 1, "balloons": n_balloon, "fbdup": n_hidden}
 
 
 # 矢尻の大きさ（OOXML の sm / med / lg）。線幅の倍数で効く
@@ -3246,12 +3538,13 @@ PAGE_CSS = """
 body.nogl{--gl:transparent}
 *{box-sizing:border-box}
 body{margin:0;background:#f3f3f3;font-family:%(ff)s;color:#000}
-.tabs{position:sticky;top:0;z-index:50;display:flex;gap:2px;padding:6px 8px 0;
-  background:#f8f8f8;border-bottom:1px solid #d0d0d0;flex-wrap:wrap}
+/* Excel と同じくシートタブは画面の下端に置く（DOM 上も本文のあと） */
+.tabs{position:sticky;bottom:0;z-index:2000000000;display:flex;gap:2px;padding:0 8px 6px;
+  background:#f8f8f8;border-top:1px solid #d0d0d0;flex-wrap:wrap}
 .tabs button{font:inherit;font-size:12px;padding:5px 14px;border:1px solid #cfcfcf;
-  border-bottom:none;border-radius:5px 5px 0 0;background:#ececec;cursor:pointer;color:#333}
-.tabs button.on{background:#fff;color:#107c41;font-weight:700;box-shadow:inset 0 2px 0 #107c41}
-.tabs .tg{margin-left:auto;align-self:center;font-size:12px;color:#444;padding:0 6px 5px;
+  border-top:none;border-radius:0 0 5px 5px;background:#ececec;cursor:pointer;color:#333}
+.tabs button.on{background:#fff;color:#107c41;font-weight:700;box-shadow:inset 0 -2px 0 #107c41}
+.tabs .tg{margin-left:auto;align-self:center;font-size:12px;color:#444;padding:5px 6px 0;
   display:flex;gap:5px;align-items:center;cursor:pointer;user-select:none}
 .tabs .tg~.tg{margin-left:14px}   /* 2つ目以降は右端に並べる */
 .wrap{padding:16px 48px 72px;overflow:auto}
@@ -3283,6 +3576,47 @@ td>i.on.open{overflow:visible;max-width:none!important;max-height:none!important
 /* 折り返しセルは絶対配置に切り替えて開く（行の高さを押し広げないため） */
 td>i.cw.on.open{position:absolute;top:0;left:0;right:0;width:auto}
 td a{color:#0563c1}
+/* 数式の吹き出し（--formula-balloons）。数式チェック用に数式セルの下へ常時出す。
+   小さめの等幅で、長い式は Python 側で括弧と引数区切りの位置で折ってある。
+   それでも入らない行はブラウザ側で折り返す（overflow-wrap）。 */
+body.nofb .fb{display:none}
+body:not(.fbdup) .fb.fbd{display:none}     /* 上や左と同じ式の繰り返しは隠す */
+.fb{position:absolute;left:0;top:100%%;margin-top:5px;
+  /* 重なったときに上・左のセルの吹き出しが手前に来るよう、行と列から z を決める */
+  z-index:var(--fbz,20);
+  width:max-content;max-width:calc(%(fbw)sch + 12px);padding:2px 5px;
+  font:400 10px/1.45 ui-monospace,SFMono-Regular,Consolas,"Courier New",monospace;
+  white-space:pre-wrap;overflow-wrap:anywhere;text-align:left;
+  color:#333;background:#fffbe6;border:1px solid #d9b95c;border-radius:3px;
+  box-shadow:0 1px 3px rgba(0,0,0,.16);cursor:zoom-in}
+.fb.fbr{left:auto;right:0}                          /* 台紙の右端をはみ出す位置 */
+.fb::before{content:"";position:absolute;top:-4px;left:9px;width:6px;height:6px;
+  background:#fffbe6;border-left:1px solid #d9b95c;border-top:1px solid #d9b95c;
+  transform:rotate(45deg)}
+.fb.fbr::before{left:auto;right:9px}
+/* 重なりを避けて下へずらした吹き出しを、元のセルにつなぐ引き出し線 */
+.fb .fbl{position:absolute;left:11px;bottom:100%%;width:1px;background:#d9b95c;
+  pointer-events:none}
+.fb.fbr .fbl{left:auto;right:11px}
+.fb.fbc{max-height:%(fbh)sem;overflow:hidden}       /* 長すぎる式は畳んでおく */
+.fb.fbc::after{content:"";position:absolute;left:0;right:0;bottom:0;height:1.45em;
+  background:linear-gradient(rgba(255,251,230,0),#fffbe6)}
+.fb:hover,.fb.open{max-height:none;z-index:1999999999;cursor:zoom-out;
+  box-shadow:0 2px 10px rgba(0,0,0,.3)}
+.fb:hover::after,.fb.open::after{display:none}
+.fb b{font-weight:inherit}
+.fb .t{color:#a31515}      /* 文字列 */
+.fb .n{color:#098658}      /* 数値・配列定数 */
+.fb .f{color:#795e26;font-weight:600}   /* 関数名 */
+.fb .r{color:#0070c1}      /* セル参照・構造参照 */
+.fb .h{color:#af00db}      /* シート名 */
+.fb .e{color:#c64a3c;font-weight:700}   /* エラー値 */
+.fb .p0{color:#0e8a9e}     /* 括弧は深さで色を変えて対応を追いやすくする */
+.fb .p1{color:#c26a00}
+.fb .p2{color:#8b5cf6}
+.fb .c{color:#8a8a8a}      /* 「×12」= 同じ式が続くセル数 */
+body.fxm td.fx::after{content:"";position:absolute;top:0;right:0;z-index:6;
+  border:3px solid transparent;border-top-color:#c64a3c;border-right-color:#c64a3c}
 .draw{position:absolute;inset:0;pointer-events:none;z-index:5}
 .dobj{position:absolute;pointer-events:auto}
 img.dobj{object-fit:fill}
@@ -3300,12 +3634,14 @@ img.dobj{object-fit:fill}
   .canvas{box-shadow:none}
   tr.pb{break-before:page}          /* Excel の改ページ位置 */
   td>i.on{box-shadow:none}
+  .fb{box-shadow:none}
 }
 """
 
 
 def build_html(title: str, sheets: list[dict]) -> str:
-    css = [PAGE_CSS % {"ff": FONT_FALLBACK, "pad": CELL_PAD, "grid": GRID_COLOR}]
+    css = [PAGE_CSS % {"ff": FONT_FALLBACK, "pad": CELL_PAD, "grid": GRID_COLOR,
+                       "fbw": FB_WRAP, "fbh": f"{FB_LINES * 1.45:.2f}"}]
     for i, s in enumerate(sheets):
         # シートごとにクラスで名前空間を切る（id で切ると詳細度が高すぎて
         # 見切れ表示などの上書きが効かなくなる）
@@ -3366,13 +3702,60 @@ function mark(sh){
   });
   kill.forEach(function(t){t.classList.add('ngr')});
 }
+// 数式の吹き出しが完全に隠れないように、重なったものを下へずらす。手前に来るもの
+// （上の行・左の列）は元の位置に残し、後ろに回るものだけを動かして上端を覗かせる。
+// ずらした分は元のセルまで引き出し線でつなぐ。
+function place(sh){
+  if(!sh)return;
+  var band=15;                       // 少なくともこの高さは見えるようにする
+  var fbs=[].slice.call(sh.querySelectorAll('.fb'));
+  fbs.forEach(function(el){
+    el.style.marginTop='';
+    var l=el.querySelector('.fbl'); if(l)l.remove();
+  });
+  fbs=fbs.filter(function(el){return el.offsetParent!==null});   // 隠れているものは除く
+  if(!fbs.length||fbs.length>3000)return;    // 多すぎるときは計算が重いので諦める
+  fbs.sort(function(a,b){
+    return (parseInt(b.style.getPropertyValue('--fbz'),10)||0)
+         - (parseInt(a.style.getPropertyValue('--fbz'),10)||0);
+  });
+  // 動かす前にまとめて測る（絶対配置なので、ずらしても他の位置は変わらない）
+  var box=fbs.map(function(el){return el.getBoundingClientRect()});
+  var placed=[],low=0;
+  fbs.forEach(function(el,i){
+    var r=box[i],t=r.top,g=0;
+    while(g++<60){                   // 重なった相手の下まで飛ばす
+      var hit=null;
+      for(var j=placed.length-1;j>=0;j--){   // 近いものから見る
+        var p=placed[j];
+        if(p.b>t&&p.t<t+band&&p.r>r.left&&p.l<r.right){hit=p;break}
+      }
+      if(!hit)break;
+      t=hit.b+2;
+    }
+    var dy=Math.round(t-r.top);
+    if(dy>0){
+      el.style.marginTop=(5+dy)+'px';
+      el.insertAdjacentHTML('afterbegin',
+        '<b class="fbl" style="height:'+(dy+5)+'px"></b>');
+    }
+    placed.push({l:r.left,r:r.right,t:t,b:t+r.height});
+    low=Math.max(low,t+r.height);
+  });
+  var cv=sh.querySelector('.canvas');        // 下にはみ出した分だけ余白を足す
+  sh.style.paddingBottom='';
+  if(cv){
+    var over=low-cv.getBoundingClientRect().bottom;
+    if(over>0)sh.style.paddingBottom=Math.ceil(over+16)+'px';
+  }
+}
 document.querySelectorAll('.tabs button').forEach(function(b){
   b.addEventListener('click',function(){
     document.querySelectorAll('.tabs button').forEach(function(x){x.classList.remove('on')});
     document.querySelectorAll('.sheet').forEach(function(x){x.classList.remove('on')});
     b.classList.add('on');
     var sh=document.getElementById('sh'+b.dataset.i);
-    sh.classList.add('on'); mark(sh);
+    sh.classList.add('on'); mark(sh); place(sh);
   });
 });
 var cb=document.getElementById('markclip');
@@ -3383,12 +3766,27 @@ var gl=document.getElementById('gridlines');
 if(gl)gl.addEventListener('change',function(){
   document.body.classList.toggle('nogl',!gl.checked);
 });
+var fb=document.getElementById('fbshow');
+if(fb)fb.addEventListener('change',function(){
+  document.body.classList.toggle('nofb',!fb.checked);
+  if(fb.checked)place(document.querySelector('.sheet.on'));
+});
+var fd=document.getElementById('fbdup');
+if(fd)fd.addEventListener('change',function(){
+  document.body.classList.toggle('fbdup',fd.checked);
+  place(document.querySelector('.sheet.on'));
+});
+var fm=document.getElementById('fxmark');
+if(fm)fm.addEventListener('change',function(){
+  document.body.classList.toggle('fxm',fm.checked);
+});
 // クリックで開閉。ドラッグ（範囲選択）と区別するため、押した位置から動いた場合と
 // 文字が選択されている場合は無視する。
 var px=0,py=0;
 document.addEventListener('mousedown',function(e){px=e.clientX;py=e.clientY},true);
 document.addEventListener('click',function(e){
-  var el=e.target.closest?e.target.closest('td>i.on'):null;
+  if(!e.target.closest)return;
+  var el=e.target.closest('.fb')||e.target.closest('td>i.on');
   if(!el)return;
   if(Math.abs(e.clientX-px)>4||Math.abs(e.clientY-py)>4)return;
   var s=window.getSelection();
@@ -3396,10 +3794,11 @@ document.addEventListener('click',function(e){
   el.classList.toggle('open');
 });
 document.addEventListener('keydown',function(e){
-  if(e.key==='Escape')document.querySelectorAll('td>i.open').forEach(function(el){
+  if(e.key==='Escape')document.querySelectorAll('td>i.open,.fb.open').forEach(function(el){
     el.classList.remove('open')});
 });
 mark(document.querySelector('.sheet.on'));
+place(document.querySelector('.sheet.on'));
 """
     toggle = ('<label class="tg" title="Excel と同じ位置で文字が切れているセルに印を付けます。'
               '印の有無にかかわらず、クリックすると全文を表示できます">'
@@ -3408,11 +3807,23 @@ mark(document.querySelector('.sheet.on'));
         toggle = ('<label class="tg" title="Excel の目盛線（薄いグレーの線）の表示を切り替えます。'
                   '印刷には元から出ません">'
                   '<input type="checkbox" id="gridlines" checked>目盛線</label>') + toggle
+    if any(s.get("balloons") for s in sheets):
+        toggle += ('<label class="tg" title="数式セルの下に数式を吹き出しで表示します。'
+                   '吹き出しにマウスを乗せると畳まれた分も含めて全文が出ます'
+                   '（クリックで固定、Esc で全部閉じる）">'
+                   '<input type="checkbox" id="fbshow" checked>数式の吹き出し</label>')
+        if any(s.get("fbdup") for s in sheets):
+            toggle += ('<label class="tg" title="上や左のセルと同じ式（コピーされた式）は、'
+                       '既定では先頭のセルだけに吹き出しを出し「×何セル分」と添えています。'
+                       'これをオンにすると、繰り返しの分も全部出します">'
+                       '<input type="checkbox" id="fbdup">同じ式も出す</label>')
+        toggle += ('<label class="tg" title="数式が入っているセルの右上に赤い三角を付けます">'
+                   '<input type="checkbox" id="fxmark">数式セルに印</label>')
     tabs_html = f'<div class="tabs">{tabs if len(sheets) > 1 else ""}{toggle}</div>'
     return (f'<!doctype html>\n<html lang="ja"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f"<title>{esc(title)}</title>\n<style>\n{''.join(css)}\n</style></head>\n"
-            f'<body>{tabs_html}<div class="wrap">{bodies}</div>'
+            f'<body><div class="wrap">{bodies}</div>{tabs_html}'
             f"<script>{script}</script></body></html>\n")
 
 
@@ -3611,7 +4022,8 @@ def convert(src: str, dst: str, opts) -> str:
 
     targets = wb.sheetnames if not opts.sheet else [opts.sheet]
     formulas: dict[str, dict] = {}
-    if opts.show_formula or opts.formula_tips or not opts.no_formula_check:
+    if (opts.show_formula or opts.formula_tips or opts.formula_balloons
+            or not opts.no_formula_check):
         try:
             formulas = load_formulas(src, targets)
         except Exception as e:
@@ -3681,7 +4093,7 @@ def convert(src: str, dst: str, opts) -> str:
         page = page_settings(ws, res["width"]) if not opts.no_page_setup else None
         po = getattr(ws, "print_options", None)
         sheets.append({"name": name, "html": res["html"], "css": res["css"], "page": page,
-                       "gridlines": gl,
+                       "gridlines": gl, "balloons": res["balloons"], "fbdup": res["fbdup"],
                        "print_gridlines": bool(gl and po is not None and po.gridLines)})
         note = f", 計算結果なしの数式{res['missing']}個" if res["missing"] else ""
         area = "（印刷範囲で切り出し）" if bounds else ""
@@ -3694,6 +4106,12 @@ def convert(src: str, dst: str, opts) -> str:
     if n_formula:
         print(f"  数式セル {n_formula} 個 → 保存済みの計算結果を表示"
               + (f"（うち {missing_total} 個は結果が未保存）" if missing_total else ""))
+    n_fb = sum(s["balloons"] for s in sheets)
+    if n_fb:
+        n_dup = sum(s["fbdup"] for s in sheets)
+        print(f"  数式の吹き出し {n_fb} 個"
+              + (f"（うち {n_dup} 個は上や左と同じ式なので先頭以外は隠しています。"
+                 "画面下部の「同じ式も出す」で全部出せます）" if n_dup else ""))
     if n_fixed:
         print(f"  シート名を出す数式 {n_fixed} 個 → 保存されていたエラーを解決して表示")
     if n_cf:
@@ -3733,8 +4151,11 @@ def main(argv=None):
     ap.add_argument("--hidden-sheets", action="store_true", help="非表示シートも出力する")
     ap.add_argument("--max-cols", type=int, default=1024, help="出力する最大列数")
     ap.add_argument("--max-rows", type=int, default=20000, help="出力する最大行数")
-    ap.add_argument("--formula-tips", action="store_true",
+    fg = ap.add_mutually_exclusive_group()
+    fg.add_argument("--formula-tips", action="store_true",
                     help="数式セルにマウスを乗せると数式を表示する")
+    fg.add_argument("--formula-balloons", action="store_true",
+                    help="数式セルの下に数式を吹き出しで常時表示する（数式チェック用）")
     ap.add_argument("--show-formula", action="store_true",
                     help="計算結果が保存されていない数式セルに、数式そのものを表示する")
     ap.add_argument("--no-formula-check", action="store_true",
