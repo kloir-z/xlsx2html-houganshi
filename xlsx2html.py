@@ -3538,8 +3538,10 @@ PAGE_CSS = """
 body.nogl{--gl:transparent}
 *{box-sizing:border-box}
 body{margin:0;background:#f3f3f3;font-family:%(ff)s;color:#000}
-/* Excel と同じくシートタブは画面の下端に置く（DOM 上も本文のあと） */
-.tabs{position:sticky;bottom:0;z-index:2000000000;display:flex;gap:2px;padding:0 8px 6px;
+/* Excel と同じくシートタブは常に画面の下端に貼り付ける（DOM 上も本文のあと）。
+   本文がタブに隠れないよう、body の下余白はタブの高さに合わせて JS で調整する */
+.tabs{position:fixed;left:0;right:0;bottom:0;z-index:2000000000;
+  display:flex;gap:2px;padding:0 8px 6px;
   background:#f8f8f8;border-top:1px solid #d0d0d0;flex-wrap:wrap}
 .tabs button{font:inherit;font-size:12px;padding:5px 14px;border:1px solid #cfcfcf;
   border-top:none;border-radius:0 0 5px 5px;background:#ececec;cursor:pointer;color:#333}
@@ -3626,7 +3628,7 @@ img.dobj{object-fit:fill}
 .dtx p{margin:0}
 @media print{
   :root{--gl:transparent}          /* Excel と同じく目盛線は印刷しない */
-  body{background:#fff}
+  body{background:#fff;padding-bottom:0!important}
   .tabs{display:none}
   .wrap{padding:0;overflow:visible}
   .sheet{display:block!important;break-after:page}
@@ -3797,6 +3799,13 @@ document.addEventListener('keydown',function(e){
   if(e.key==='Escape')document.querySelectorAll('td>i.open,.fb.open').forEach(function(el){
     el.classList.remove('open')});
 });
+// タブは画面下端に固定なので、本文の下にその高さぶんの余白を空ける
+function fitTabs(){
+  var t=document.querySelector('.tabs');
+  if(t)document.body.style.paddingBottom=t.offsetHeight+'px';
+}
+window.addEventListener('resize',fitTabs);
+fitTabs();
 mark(document.querySelector('.sheet.on'));
 place(document.querySelector('.sheet.on'));
 """
